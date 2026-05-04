@@ -2,12 +2,13 @@ with Interfaces;
 with System;
 with ESP32.GPIO;
 with ESP32.S3.GPIO;
+with ESP32.S3.Interrupts;
 
 package body GPIO0_Interrupt is
    use type Interfaces.Unsigned_32;
 
    GPIO0            : constant ESP32.S3.GPIO.Safe_GPIO_Pin := 0;
-   GPIO_Intr_Source : constant := ESP32.S3.GPIO.Core_0_Interrupt_Source;
+   GPIO_Intr_Source : constant := ESP32.S3.Interrupts.GPIO_Core_0;
 
    protected GPIO0_Handler is
       pragma Interrupt_Priority (System.Interrupt_Priority'Last);

@@ -2,7 +2,6 @@
 --  This package narrows the generic ESP32.GPIO types to the concrete pin range
 --  of the ESP32-S3 silicon and defines Safe_GPIO_Pin which additionally
 --  excludes pins reserved for internal flash and PSRAM.
-with Ada.Interrupts;
 with ESP32.GPIO;
 
 package ESP32.S3.GPIO is
@@ -39,12 +38,5 @@ package ESP32.S3.GPIO is
      Static_Predicate =>
        Safe_GPIO_Pin not in Flash_Pin_First .. Flash_Pin_Last
        and Safe_GPIO_Pin not in PSRAM_Pin_First .. PSRAM_Pin_Last;
-
-   --  -----------------------------------------------------------------------
-   --  Interrupt matrix source IDs (from
-   --  esp-idf/components/soc/esp32s3/include/soc/interrupts.h).
-   --  -----------------------------------------------------------------------
-   Core_0_Interrupt_Source : constant Ada.Interrupts.Interrupt_ID := 16;
-   Core_1_Interrupt_Source : constant Ada.Interrupts.Interrupt_ID := 18;
 
 end ESP32.S3.GPIO;
