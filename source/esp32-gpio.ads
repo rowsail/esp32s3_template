@@ -18,7 +18,12 @@ package ESP32.GPIO is
    GPIO_Error : exception;
 
    type GPIO_Mode is
-     (Mode_Disable, Mode_Input, Mode_Output, Mode_Output_Open_Drain, Mode_Input_Output_Open_Drain, Mode_Input_Output);
+     (Mode_Disable,
+      Mode_Input,
+      Mode_Output,
+      Mode_Output_Open_Drain,
+      Mode_Input_Output_Open_Drain,
+      Mode_Input_Output);
 
    for GPIO_Mode use
      (Mode_Disable                 => 0,
@@ -29,7 +34,12 @@ package ESP32.GPIO is
       Mode_Input_Output            => 5);
 
    type GPIO_Intr_Type is
-     (Intr_Disabled, Intr_Positive_Edge, Intr_Negative_Edge, Intr_Any_Edge, Intr_Low_Level, Intr_High_Level);
+     (Intr_Disabled,
+      Intr_Positive_Edge,
+      Intr_Negative_Edge,
+      Intr_Any_Edge,
+      Intr_Low_Level,
+      Intr_High_Level);
 
    for GPIO_Intr_Type use
      (Intr_Disabled      => 0,
@@ -42,33 +52,32 @@ package ESP32.GPIO is
    type GPIO_Level is (Low, High);
 
    type GPIO_Pin_Config is record
-      Reset_First      : Boolean        := True;
-      Mode             : GPIO_Mode      := Mode_Disable;
-      Pullup           : Boolean        := False;
-      Pulldown         : Boolean        := False;
+      Reset_First      : Boolean := True;
+      Mode             : GPIO_Mode := Mode_Disable;
+      Pullup           : Boolean := False;
+      Pulldown         : Boolean := False;
       Interrupt_Type   : GPIO_Intr_Type := Intr_Disabled;
-      Interrupt_Enable : Boolean        := False;
+      Interrupt_Enable : Boolean := False;
    end record
-   with Dynamic_Predicate =>
-     (case GPIO_Pin_Config.Mode is
-        --  Pure output: internal pull resistors are pointless and ignored by
-        --  the IDF, so disallow both.
-        when Mode_Output                  =>
-          not GPIO_Pin_Config.Pullup and not GPIO_Pin_Config.Pulldown,
-        --  Open-drain output (and bidirectional open-drain): a pull-up is
-        --  useful to hold the bus high; pull-down is not meaningful.
-        when Mode_Output_Open_Drain |
-             Mode_Input_Output_Open_Drain =>
-          not GPIO_Pin_Config.Pulldown,
-        --  Input and bidirectional push-pull: one or neither pull resistor is
-        --  valid, but enabling both simultaneously is a configuration error.
-        when Mode_Input |
-             Mode_Input_Output            =>
-          not (GPIO_Pin_Config.Pullup and GPIO_Pin_Config.Pulldown),
-        --  Disabled pin: no pull resistor combination makes sense, but at
-        --  most one is tolerated.
-        when Mode_Disable                 =>
-          not (GPIO_Pin_Config.Pullup and GPIO_Pin_Config.Pulldown));
+   with
+     Dynamic_Predicate =>
+       (case GPIO_Pin_Config.Mode is
+          --  Pure output: internal pull resistors are pointless and ignored by
+          --  the IDF, so disallow both.
+          when Mode_Output                                           =>
+            not GPIO_Pin_Config.Pullup and not GPIO_Pin_Config.Pulldown,
+          --  Open-drain output (and bidirectional open-drain): a pull-up is
+          --  useful to hold the bus high; pull-down is not meaningful.
+          when Mode_Output_Open_Drain | Mode_Input_Output_Open_Drain =>
+            not GPIO_Pin_Config.Pulldown,
+          --  Input and bidirectional push-pull: one or neither pull resistor is
+          --  valid, but enabling both simultaneously is a configuration error.
+          when Mode_Input | Mode_Input_Output                        =>
+            not (GPIO_Pin_Config.Pullup and GPIO_Pin_Config.Pulldown),
+          --  Disabled pin: no pull resistor combination makes sense, but at
+          --  most one is tolerated.
+          when Mode_Disable                                          =>
+            not (GPIO_Pin_Config.Pullup and GPIO_Pin_Config.Pulldown));
 
    procedure Reset_Pin (Pin : GPIO_Pin);
 

@@ -59,8 +59,55 @@ The project introduces a two-level Ada package hierarchy for GPIO that separates
   Assigning a reserved pin number to `Safe_GPIO_Pin` is caught at **compile time** when the
   value is a static literal or named constant.
 
-* `Core_0_Interrupt_Source` and `Core_1_Interrupt_Source` — the ESP32-S3 GPIO interrupt
-  matrix source IDs used when registering interrupt handlers.
+### `ESP32.S3.Interrupts` — full interrupt source table
+
+`source/esp32-s3-interrupts.ads` enumerates every one of the 99 ESP32-S3 peripheral
+interrupt sources (0 .. 98) as named `Interrupt_Source` constants.
+
+* `Interrupt_Source` — a subtype of `Ada.Interrupts.Interrupt_ID` constrained to
+  `0 .. 98` with a `Static_Predicate` that excludes the four reserved slots that
+  have no corresponding peripheral:
+
+  | Reserved ID | Note |
+  |-------------|------|
+  | 23 | not assigned |
+  | 33 | not assigned |
+  | 34 | not assigned |
+  | 46 | not assigned |
+
+  Assigning a reserved value to `Interrupt_Source` is a **compile-time error** when
+  the value is a static literal or named constant.  A runtime guard
+  (`__gnat_is_valid_intr_source`, implemented in `freertos.c` using the IDF's own
+  `esp_isr_names[]` table) catches any dynamically-produced reserved ID before it
+  reaches `esp_intr_alloc`.
+
+* `Max_Interrupt_Source : constant := 99` — the total count; deliberately left
+  untyped so it can be used in contexts that require a universal integer.
+
+* Named constants covering every source group — wireless/Bluetooth (0–15), GPIO
+  (16–19), SPI (20–22), audio/video (24–26), UART (27–29), storage/PWM (30–32),
+  miscellaneous peripherals (35–45), timers (47–59), cache/MMU (60–65), GDMA
+  (66–75), crypto accelerators (76–78), inter-processor interrupts (79–82), and
+  the Permission Management System (83–98).
+
+The GPIO source IDs (`GPIO_Core_0 = 16`, `GPIO_Core_1 = 18`) previously lived in
+`ESP32.S3.GPIO`; they have been moved here so that the GPIO package concerns itself
+only with pin geometry and the interrupts package owns the interrupt matrix.
+
+#### Target-portable source IDs
+
+To avoid hard-coding numeric IDs that differ between ESP32 variants, the two values
+that are used at run time — `ETS_GPIO_INTR_SOURCE` and `ETS_GPIO_INTR_SOURCE2` — are
+exported from C via `soc/interrupts.h`:
+
+```c
+// freertos.c
+int __gnat_gpio_intr_source_core0 = ETS_GPIO_INTR_SOURCE;   // 16 on S3
+int __gnat_gpio_intr_source_core1 = ETS_GPIO_INTR_SOURCE2;  // 18 on S3, -1 on single-core
+```
+
+The Ada runtime imports these variables rather than using a literal, so the same
+binary is correct for every ESP32 chip without any source changes.
 
 ## Interrupt Handling with the Jorvik Profile
 
@@ -71,11 +118,12 @@ declaration is fully supported and is the idiomatic Jorvik approach.
 
 A protected object with `pragma Interrupt_Priority` and `pragma Attach_Handler` maps
 directly onto the ESP-IDF interrupt-matrix mechanism.  The runtime allocates a CPU interrupt
-slot at elaboration time via `__gnat_esp_intr_alloc` and registers the handler — no dynamic
-binding and no calls to `esp_intr_alloc` from user code.
+slot at elaboration time via `__gnat_esp_intr_alloc_c_handler` and registers the handler —
+no dynamic binding and no calls to `esp_intr_alloc` from user code.
 
 ```ada
 protected GPIO0_Handler is
+   --  Interrupt_Priority'Last selects ESP-IDF C-callable level 3 (see below).
    pragma Interrupt_Priority (System.Interrupt_Priority'Last);
    procedure On_Low;
    pragma Attach_Handler (On_Low, GPIO_Intr_Source);  --  static, Jorvik-safe
@@ -85,8 +133,33 @@ private
 end GPIO0_Handler;
 ```
 
-`GPIO_Intr_Source` is a static constant (`ESP32.S3.GPIO.Core_0_Interrupt_Source = 16`), so
+`GPIO_Intr_Source` is a static constant (`ESP32.S3.Interrupts.GPIO_Core_0 = 16`), so
 the attachment is resolved entirely at compile/elaboration time.
+
+### Interrupt priority mapping
+
+The Xtensa core has seven hardware interrupt levels, but only levels 1–3 support
+C function calls.  Levels 4, 5, and the NMI require hand-written assembly entry
+points and cannot be used with Ada protected handlers.
+
+The runtime maps the Ada `Interrupt_Priority` range (241–255) proportionally onto
+ESP-IDF C-callable levels 1–3 in `__gnat_esp_intr_alloc_c_handler`:
+
+| Ada `Interrupt_Priority` | ESP-IDF flag | Xtensa hardware level |
+|--------------------------|--------------|----------------------|
+| 241–245 | `ESP_INTR_FLAG_LEVEL1` | 1 (lowest) |
+| 246–250 | `ESP_INTR_FLAG_LEVEL2` | 2 |
+| 251–255 | `ESP_INTR_FLAG_LEVEL3` | 3 (highest C-callable) |
+
+`Interrupt_Priority'Last` (255) therefore selects hardware level 3 — the highest
+priority at which a C-callable (and therefore Ada) handler can run.  Assembly-only
+levels 4/5/NMI are never selected regardless of the priority value passed in.
+
+Previous versions of the runtime ignored the priority entirely; the IDF always
+allocated a level-1 slot.  The runtime now threads the `Interrupt_Priority` value
+through `Install_Restricted_Handlers` → `Install_Handler` → the C helper, so the
+hardware level truly reflects the Ada ceiling priority declared in the protected
+object.
 
 ## Example: GPIO0 Falling-Edge Interrupt Counter
 
@@ -134,7 +207,21 @@ the attachment is resolved entirely at compile/elaboration time.
    end loop;
    ```
 
-Pull GPIO0 to GND to trigger the interrupt and watch the counter increment on the serial monitor.
+Pull GPIO0 to GND to trigger the interrupt and watch the counter increment on the serial
+monitor.
+
+### Compile-time and runtime safety
+
+The interrupt framework provides two layers of protection against misuse:
+
+1. **Compile time** — `Interrupt_Source` carries a `Static_Predicate` that rejects the four
+   reserved IDs (23, 33, 34, 46).  A static expression that names a reserved slot is a
+   compile error, not a silent misfire.
+
+2. **Run time** — before calling `esp_intr_alloc`, the runtime checks the source ID against
+   the IDF's internal `esp_isr_names[]` table (NULL entries mark reserved slots) via
+   `__gnat_is_valid_intr_source`.  A reserved ID raises `Program_Error` rather than
+   producing undefined behaviour in the interrupt matrix.
 
 > **Tip:** GPIO0 is the ESP32-S3 boot-mode strapping pin.  Most development boards (e.g.
 > ESP32-S3-DevKitC) already have a "BOOT" push button wired between GPIO0 and GND — so no
