@@ -1,23 +1,16 @@
-# ESP32-S3 Ada Project Template (ESP-IDF Integrated)
+# ESP32-S3 Ada Project Template — Interrupt Support Fork
 
 [![Build](https://github.com/godunko/esp32s3_template/actions/workflows/main.yaml/badge.svg)](https://github.com/godunko/esp32s3_template/actions/workflows/main.yaml)
 
-This repository provides a template for integrating Ada source code into the ESP-IDF (C-based) build system.
-It allows you to leverage the robust drivers and RTOS capabilities of the ESP-IDF while writing your application logic in Ada.
+This repository is a fork of
+[godunko/esp32s3_template](https://github.com/godunko/esp32s3_template).
+It extends the upstream template with a complete interrupt-handling framework:
+all 99 ESP32-S3 peripheral interrupt sources are modelled in Ada, the Ada
+ceiling-priority is wired through to the ESP-IDF hardware-level allocator, and
+compile-time and runtime guards prevent misuse of reserved interrupt source IDs.
 
-The example application demonstrates GPIO input with a falling-edge interrupt handler,
-written entirely in Ada using the Jorvik real-time profile.
-
-## Project Architecture
-
-Instead of a standalone Ada executable, this project compiles Ada source into a encapsulated static library that is linked into the final ESP-IDF project.
-
- * Ada Side: Managed by Alire (`alr`).
- * System Side: Managed by IDF (`CMake`/`ninja`).
-
-## Prerequisites and Build Instructions
-
-Prerequisites and build instructions are documented in the upstream repository this project was forked from:
+For project architecture, prerequisites, and build instructions refer to the
+upstream README at
 [godunko/esp32s3_template](https://github.com/godunko/esp32s3_template).
 
 Once built and flashed you should see:
@@ -33,117 +26,95 @@ GPIO0 interrupt count: 2
 ...
 ```
 
-## GPIO Abstraction Packages
+> **Tip:** GPIO0 is the ESP32-S3 boot-mode strapping pin.  Most development
+> boards (e.g. ESP32-S3-DevKitC) have a "BOOT" button wired between GPIO0 and
+> GND — pressing it while the firmware is running fires the interrupt rather
+> than resetting into the bootloader, because the chip only samples the
+> strapping pin at power-on.
 
-The project introduces a two-level Ada package hierarchy for GPIO that separates the portable API from chip-specific details.
+---
 
-### `ESP32.GPIO` — portable API
-
-`source/esp32-gpio.ads` / `esp32-gpio.adb` define the generic GPIO interface used by all ESP32 variants:
-
-* `GPIO_Pin` — an unconstrained non-negative integer type accepted by the IDF.
-* Direction, pull-up/pull-down, interrupt-type enumerations with IDF representation clauses.
-* Thin Ada wrappers around the IDF C functions (`gpio_reset_pin`, `gpio_set_direction`, etc.).
-* `GPIO_Error` exception raised on any IDF error return.
-
-### `ESP32.S3.GPIO` — ESP32-S3 specifics
-
-`source/esp32-s3-gpio.ads` narrows the portable types to the concrete ESP32-S3 silicon:
-
-* `GPIO_Min_Pin = 0`, `GPIO_Max_Pin = 48` — the full S3 range.
-* `Safe_GPIO_Pin` — a subtype with both a range constraint *and* a `Static_Predicate` that
-  excludes the two reserved regions:
-  * GPIO 26–32 — internal SPI flash (SPI0 / SPI1)
-  * GPIO 33–37 — Octal PSRAM (on modules such as ESP32-S3-WROOM-1-N8R8)
-
-  Assigning a reserved pin number to `Safe_GPIO_Pin` is caught at **compile time** when the
-  value is a static literal or named constant.
+## Changes from upstream
 
 ### `ESP32.S3.Interrupts` — full interrupt source table
 
-`source/esp32-s3-interrupts.ads` enumerates every one of the 99 ESP32-S3 peripheral
-interrupt sources (0 .. 98) as named `Interrupt_Source` constants.
+The upstream template handled only the two GPIO interrupt sources and expressed
+them as bare integer constants in `ESP32.S3.GPIO`.  This fork introduces
+`source/esp32-s3-interrupts.ads`, which:
 
-* `Interrupt_Source` — a subtype of `Ada.Interrupts.Interrupt_ID` constrained to
-  `0 .. 98` with a `Static_Predicate` that excludes the four reserved slots that
-  have no corresponding peripheral:
+* Moves the GPIO source IDs out of `ESP32.S3.GPIO` so that the GPIO package
+  concerns itself only with pin geometry.
+* Adds a named constant for **every one of the 99 ESP32-S3 peripheral interrupt
+  sources** (0 .. 98), grouped by peripheral family:
 
-  | Reserved ID | Note |
-  |-------------|------|
-  | 23 | not assigned |
-  | 33 | not assigned |
-  | 34 | not assigned |
-  | 46 | not assigned |
+  | Range | Group |
+  |-------|-------|
+  | 0–15 | Wireless / Bluetooth |
+  | 16–19 | GPIO (Core 0 and Core 1, normal and NMI variants) |
+  | 20–22 | SPI (note: SPI1 is the internal flash bus — do not use) |
+  | 24–26 | LCD / I²S audio/video |
+  | 27–29 | UART |
+  | 30–32 | SDIO / PWM |
+  | 35–45 | Miscellaneous (LEDC, eFuse, TWAI/CAN, USB OTG, RTC, RMT, PCNT, I²C, DMA) |
+  | 47–59 | Timers (WDT, TGn, system timer) |
+  | 60–65 | Cache / MMU |
+  | 66–75 | General-purpose DMA (in/out channels 0–4) |
+  | 76–78 | Crypto accelerators (RSA, AES, SHA) |
+  | 79–82 | Inter-processor interrupts (FreeRTOS / IPC) |
+  | 83–98 | Permission Management System (PMS) |
 
-  Assigning a reserved value to `Interrupt_Source` is a **compile-time error** when
-  the value is a static literal or named constant.  A runtime guard
-  (`__gnat_is_valid_intr_source`, implemented in `freertos.c` using the IDF's own
-  `esp_isr_names[]` table) catches any dynamically-produced reserved ID before it
-  reaches `esp_intr_alloc`.
+* Defines a **`Static_Predicate`** on the `Interrupt_Source` subtype that
+  excludes the four reserved slots that have no peripheral:
 
-* `Max_Interrupt_Source : constant := 99` — the total count; deliberately left
-  untyped so it can be used in contexts that require a universal integer.
+  | Reserved ID | Reason |
+  |-------------|--------|
+  | 23 | not assigned on ESP32-S3 |
+  | 33 | not assigned on ESP32-S3 |
+  | 34 | not assigned on ESP32-S3 |
+  | 46 | not assigned on ESP32-S3 |
 
-* Named constants covering every source group — wireless/Bluetooth (0–15), GPIO
-  (16–19), SPI (20–22), audio/video (24–26), UART (27–29), storage/PWM (30–32),
-  miscellaneous peripherals (35–45), timers (47–59), cache/MMU (60–65), GDMA
-  (66–75), crypto accelerators (76–78), inter-processor interrupts (79–82), and
-  the Permission Management System (83–98).
-
-The GPIO source IDs (`GPIO_Core_0 = 16`, `GPIO_Core_1 = 18`) previously lived in
-`ESP32.S3.GPIO`; they have been moved here so that the GPIO package concerns itself
-only with pin geometry and the interrupts package owns the interrupt matrix.
+  Using a reserved ID in a static context (literal, named constant) is a
+  **compile-time error**.
 
 #### Target-portable source IDs
 
-To avoid hard-coding numeric IDs that differ between ESP32 variants, the two values
-that are used at run time — `ETS_GPIO_INTR_SOURCE` and `ETS_GPIO_INTR_SOURCE2` — are
-exported from C via `soc/interrupts.h`:
+The numeric values of `ETS_GPIO_INTR_SOURCE` and `ETS_GPIO_INTR_SOURCE2`
+differ between ESP32 variants.  To avoid embedding chip-specific numbers in
+Ada source, the two values used at run time are exported from C via
+`soc/interrupts.h`:
 
 ```c
-// freertos.c
-int __gnat_gpio_intr_source_core0 = ETS_GPIO_INTR_SOURCE;   // 16 on S3
-int __gnat_gpio_intr_source_core1 = ETS_GPIO_INTR_SOURCE2;  // 18 on S3, -1 on single-core
+// crates/espidf_gnat_runtime/source/freertos.c
+const int __gnat_gpio_intr_source_core0 = ETS_GPIO_INTR_SOURCE;
+#ifdef ETS_GPIO_INTR_SOURCE2
+const int __gnat_gpio_intr_source_core1 = ETS_GPIO_INTR_SOURCE2;
+#else
+const int __gnat_gpio_intr_source_core1 = -1;  // single-core chip: not present
+#endif
 ```
 
-The Ada runtime imports these variables rather than using a literal, so the same
-binary is correct for every ESP32 chip without any source changes.
+The Ada runtime (`s-interr.adb`) imports these as `Interfaces.C.int` variables
+and uses them at elaboration time.  No Ada source file needs editing when
+retargeting to a different ESP32 variant.
 
-## Interrupt Handling with the Jorvik Profile
+---
 
-The project uses `pragma Profile (Jorvik)`, which implies `No_Dynamic_Attachment`.
-Dynamic calls such as `Ada.Interrupts.Attach_Handler` at run time raise `Program_Error`
-under this profile.  Static attachment via `pragma Attach_Handler` inside a protected type
-declaration is fully supported and is the idiomatic Jorvik approach.
+### Interrupt priority wired through to ESP-IDF
 
-A protected object with `pragma Interrupt_Priority` and `pragma Attach_Handler` maps
-directly onto the ESP-IDF interrupt-matrix mechanism.  The runtime allocates a CPU interrupt
-slot at elaboration time via `__gnat_esp_intr_alloc_c_handler` and registers the handler —
-no dynamic binding and no calls to `esp_intr_alloc` from user code.
+The upstream runtime allocated every interrupt handler at ESP-IDF level 1
+regardless of the Ada ceiling priority declared in the protected object.  This
+fork threads the `Interrupt_Priority` value all the way through:
 
-```ada
-protected GPIO0_Handler is
-   --  Interrupt_Priority'Last selects ESP-IDF C-callable level 3 (see below).
-   pragma Interrupt_Priority (System.Interrupt_Priority'Last);
-   procedure On_Low;
-   pragma Attach_Handler (On_Low, GPIO_Intr_Source);  --  static, Jorvik-safe
-   function Trigger_Count return Interfaces.Unsigned_32;
-private
-   Press_Count : Interfaces.Unsigned_32 := 0;
-end GPIO0_Handler;
+```
+Install_Restricted_Handlers (Prio, Handlers)   -- s-interr.adb
+  └─► Install_Handler (Interrupt, Prio)
+        └─► __gnat_esp_intr_alloc_c_handler (source, ada_interrupt_priority, …)
+              └─► esp_intr_alloc (source, ESP_INTR_FLAG_LEVELn, …)
 ```
 
-`GPIO_Intr_Source` is a static constant (`ESP32.S3.Interrupts.GPIO_Core_0 = 16`), so
-the attachment is resolved entirely at compile/elaboration time.
-
-### Interrupt priority mapping
-
-The Xtensa core has seven hardware interrupt levels, but only levels 1–3 support
-C function calls.  Levels 4, 5, and the NMI require hand-written assembly entry
-points and cannot be used with Ada protected handlers.
-
-The runtime maps the Ada `Interrupt_Priority` range (241–255) proportionally onto
-ESP-IDF C-callable levels 1–3 in `__gnat_esp_intr_alloc_c_handler`:
+`__gnat_esp_intr_alloc_c_handler` (in `freertos.c`) maps the Ada
+`Interrupt_Priority` range proportionally onto the three ESP-IDF C-callable
+hardware levels:
 
 | Ada `Interrupt_Priority` | ESP-IDF flag | Xtensa hardware level |
 |--------------------------|--------------|----------------------|
@@ -151,155 +122,91 @@ ESP-IDF C-callable levels 1–3 in `__gnat_esp_intr_alloc_c_handler`:
 | 246–250 | `ESP_INTR_FLAG_LEVEL2` | 2 |
 | 251–255 | `ESP_INTR_FLAG_LEVEL3` | 3 (highest C-callable) |
 
-`Interrupt_Priority'Last` (255) therefore selects hardware level 3 — the highest
-priority at which a C-callable (and therefore Ada) handler can run.  Assembly-only
-levels 4/5/NMI are never selected regardless of the priority value passed in.
+The Xtensa core has seven hardware interrupt levels.  Levels 4, 5, and NMI
+require hand-written assembly entry points and cannot invoke C (or Ada)
+functions.  The mapping deliberately caps at level 3.
+`Interrupt_Priority'Last` (255) therefore requests the highest level at which
+an Ada handler can safely execute.
 
-Previous versions of the runtime ignored the priority entirely; the IDF always
-allocated a level-1 slot.  The runtime now threads the `Interrupt_Priority` value
-through `Install_Restricted_Handlers` → `Install_Handler` → the C helper, so the
-hardware level truly reflects the Ada ceiling priority declared in the protected
-object.
+---
 
-### How interrupt attachment reaches the ESP-IDF
+### Full call path from Ada to silicon
 
-When the Ada runtime elaborates a package that contains a protected object with
-`pragma Attach_Handler`, it calls `System.Interrupts.Install_Restricted_Handlers`
-(implemented in `crates/espidf_gnat_runtime/source/s-interr.adb`).  That routine
-walks the handler array and calls `Install_Handler` once per source.  The full
-chain from Ada to silicon is:
+#### Elaboration (handler registration)
+
+When the runtime elaborates a package containing a protected object with
+`pragma Attach_Handler`, the following chain executes:
 
 ```
 Ada protected object elaboration
   │
   └─► System.Interrupts.Install_Restricted_Handlers   (s-interr.adb)
-        │  stores User_Handler  (Ada procedure pointer)
-        │  stores Source_Arg    (interrupt source ID as a C int)
+        │  records: User_Handlers[source] ← Ada procedure pointer
+        │           Source_Args[source]   ← source ID (C int)
         └─► Install_Handler (source id, Ada ceiling priority)
-              │  calls __gnat_is_valid_intr_source     (freertos.c)
-              │    └─► checks esp_isr_names[source] != NULL
-              └─► __gnat_esp_intr_alloc_c_handler      (freertos.c)
-                    │  maps Ada priority 241-255 → ESP_INTR_FLAG_LEVELn
+              │
+              ├─► __gnat_is_valid_intr_source (freertos.c)
+              │     checks esp_isr_names[source] != NULL
+              │     raises Program_Error for reserved or out-of-range IDs
+              │
+              └─► __gnat_esp_intr_alloc_c_handler (freertos.c)
+                    maps Ada priority 241..255 → ESP_INTR_FLAG_LEVELn
                     └─► esp_intr_alloc (source, flags,
                               Interrupt_Trampoline, &Source_Args[source],
-                              &handle)           ← ESP-IDF interrupt matrix API
+                              &handle)
 ```
 
-**`esp_intr_alloc`** is the central ESP-IDF function for interrupt registration.
-It programmes the Xtensa interrupt-matrix peripheral, which connects any of the
-99 peripheral interrupt sources to one of the 32 CPU interrupt lines, and
-associates a C function pointer and a single `void *` argument with that line.
-The `ESP_INTR_FLAG_LEVELn` flag tells the IDF which hardware priority level to
-request when allocating a CPU interrupt line.
+`esp_intr_alloc` programmes the Xtensa interrupt-matrix peripheral, connecting
+the peripheral source to a CPU interrupt line at the requested hardware level
+and binding `Interrupt_Trampoline` as the handler.
 
-**`Interrupt_Trampoline`** is the C-callable function that is actually registered
-with `esp_intr_alloc`.  It receives a pointer to the source ID stored in
-`Source_Args`, looks up the corresponding Ada `Parameterless_Handler` in the
-`User_Handlers` table, and calls it.  Before dispatching to the Ada handler it
-performs one piece of housekeeping that the IDF does *not* do automatically for
-GPIO: it reads and clears the GPIO interrupt-status registers using the HAL
-primitives `gpio_ll_get_intr_status` / `gpio_ll_clear_intr_status` (from
-`hal/gpio_ll.h`).  Every other peripheral is expected to clear its own status
-register inside its own handler; GPIO is the exception because a single status
-register covers all pins simultaneously and must be cleared before re-enabling
-interrupts.
+#### Dispatch (interrupt fires)
 
 ```
 CPU receives interrupt (hardware)
   │
-  └─► Interrupt_Trampoline(arg)          (s-interr.adb / C convention)
-        │  arg → Source_Args[n] → source id
-        │  if source == GPIO Core-0:
-        │    gpio_ll_get_intr_status  ──► read GPIO_STATUS_REG
-        │    gpio_ll_clear_intr_status ──► write GPIO_STATUS_W1TC_REG
-        │  User_Handlers[source_id].all  (Ada protected procedure)
-        └─► returns to FreeRTOS interrupt dispatcher
+  └─► Interrupt_Trampoline(arg)             (s-interr.adb, Convention => C)
+        │  arg → &Source_Args[n] → source ID
+        │
+        ├─► if source == GPIO Core-0 or Core-1:
+        │     gpio_ll_get_intr_status        (hal/gpio_ll.h)
+        │     gpio_ll_clear_intr_status      (hal/gpio_ll.h)
+        │     (GPIO is the only source whose status register the runtime
+        │      must clear; all other peripherals do this in their own handler)
+        │
+        └─► User_Handlers[source_id].all     (Ada protected procedure)
+              └─► returns to FreeRTOS interrupt dispatcher
 ```
 
-**`__gnat_is_valid_intr_source`** queries `esp_isr_names[]`, an IDF-internal
-table that maps each source index to a human-readable name string.  Slots that
-are reserved or do not exist on the current chip hold `NULL`; valid slots hold a
-non-NULL pointer.  This lets the runtime validate a source ID against the actual
-chip without needing any chip-specific Ada code.
+#### Source-ID validation
 
-## Example: GPIO0 Falling-Edge Interrupt Counter
+`__gnat_is_valid_intr_source` checks the ESP-IDF internal table
+`esp_isr_names[]`.  Each entry is either a non-NULL name string (valid source)
+or `NULL` (reserved / not present on this chip).  This makes the check
+chip-portable with no Ada-side chip knowledge.
 
-`source/gpio0_interrupt.ads` / `.adb` demonstrate the full pattern:
+---
 
-1. **Pin configuration** — `Initialize` calls the `ESP32.GPIO` API to configure GPIO0 as
-   an input with pull-up enabled and a falling-edge interrupt:
+### Compile-time and runtime safety summary
 
-   ```ada
-   ESP32.GPIO.Reset_Pin        (GPIO0);
-   ESP32.GPIO.Set_Direction    (GPIO0, ESP32.GPIO.Mode_Input);
-   ESP32.GPIO.Pullup_Enable    (GPIO0);
-   ESP32.GPIO.Pulldown_Disable (GPIO0);
-   ESP32.GPIO.Set_Intr_Type    (GPIO0, ESP32.GPIO.Intr_Negative_Edge);
-   ESP32.GPIO.Intr_Enable      (GPIO0);
-   ```
+| Layer | Mechanism | What it catches |
+|-------|-----------|-----------------|
+| Compile time | `Static_Predicate` on `Interrupt_Source` | Reserved IDs (23, 33, 34, 46) used as static expressions |
+| Run time | `__gnat_is_valid_intr_source` / `esp_isr_names[]` | Reserved IDs produced dynamically; IDs outside 0..98 |
+| Run time | `esp_intr_alloc` return-value check | IDF allocation failures (e.g. no free CPU interrupt line) |
 
-   `GPIO0` is declared as `Safe_GPIO_Pin := 0`, so a typo that produces a reserved pin
-   number would be rejected at compile time.
-
-2. **Interrupt handler** — the protected procedure `On_Low` increments a counter using the
-   Ada 2022 target-name shorthand:
-
-   ```ada
-   procedure On_Low is
-   begin
-      Press_Count := @ + 1;
-   end On_Low;
-   ```
-
-3. **Main loop** — `source/main.adb` polls `GPIO0_Interrupt.Trigger_Count` every 50 ms and
-   prints a line each time the count changes:
-
-   ```ada
-   loop
-      declare
-         Count : constant Interfaces.Unsigned_32 := GPIO0_Interrupt.Trigger_Count;
-      begin
-         if Count /= Last_Count then
-            Last_Count := Count;
-            Ada.Text_IO.Put_Line ("GPIO0 interrupt count:" & Interfaces.Unsigned_32'Image (Count));
-         end if;
-      end;
-      delay 0.05;
-   end loop;
-   ```
-
-Pull GPIO0 to GND to trigger the interrupt and watch the counter increment on the serial
-monitor.
-
-### Compile-time and runtime safety
-
-The interrupt framework provides two layers of protection against misuse:
-
-1. **Compile time** — `Interrupt_Source` carries a `Static_Predicate` that rejects the four
-   reserved IDs (23, 33, 34, 46).  A static expression that names a reserved slot is a
-   compile error, not a silent misfire.
-
-2. **Run time** — before calling `esp_intr_alloc`, the runtime checks the source ID against
-   the IDF's internal `esp_isr_names[]` table (NULL entries mark reserved slots) via
-   `__gnat_is_valid_intr_source`.  A reserved ID raises `Program_Error` rather than
-   producing undefined behaviour in the interrupt matrix.
-
-> **Tip:** GPIO0 is the ESP32-S3 boot-mode strapping pin.  Most development boards (e.g.
-> ESP32-S3-DevKitC) already have a "BOOT" push button wired between GPIO0 and GND — so no
-> extra hardware is needed to run this example.  Pressing BOOT while the firmware is running
-> will fire the interrupt rather than resetting into the bootloader, because the chip only
-> samples the strapping pin during reset.
-
-`ESP-IDF` and `Ada & SPARK` extensions for VS Code creates useful development environment.
+---
 
 ## VS Code Integration
 
-To get the most out of this template, it is recommend installing the following extensions:
+The following extensions are recommended:
 
- * ESP-IDF Extension: Manages flashing, monitoring, and the SDK configuration (menuconfig).
- * Ada & SPARK Extension: Provides syntax highlighting, IntelliSense, and code navigation for Ada.
+* **ESP-IDF Extension** — build, flash, monitor, menuconfig.
+* **Ada & SPARK Extension** — syntax highlighting, IntelliSense, code navigation.
 
-# Related repositories
+## Related repositories
 
- * [ESP-IDF GNAT Runtime](https://github.com/godunko/espidf_gnat_runtime)
- * [Ada/ESP-IDF Binding](https://github.com/godunko/espidf)
+* [godunko/esp32s3_template](https://github.com/godunko/esp32s3_template) — upstream template this fork is based on
+* [rowsail/espidf_gnat_runtime](https://github.com/rowsail/espidf_gnat_runtime) — forked runtime with interrupt support changes
+* [godunko/espidf_gnat_runtime](https://github.com/godunko/espidf_gnat_runtime) — upstream runtime
+* [godunko/espidf](https://github.com/godunko/espidf) — Ada/ESP-IDF binding
