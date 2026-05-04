@@ -161,6 +161,67 @@ through `Install_Restricted_Handlers` → `Install_Handler` → the C helper, so
 hardware level truly reflects the Ada ceiling priority declared in the protected
 object.
 
+### How interrupt attachment reaches the ESP-IDF
+
+When the Ada runtime elaborates a package that contains a protected object with
+`pragma Attach_Handler`, it calls `System.Interrupts.Install_Restricted_Handlers`
+(implemented in `crates/espidf_gnat_runtime/source/s-interr.adb`).  That routine
+walks the handler array and calls `Install_Handler` once per source.  The full
+chain from Ada to silicon is:
+
+```
+Ada protected object elaboration
+  │
+  └─► System.Interrupts.Install_Restricted_Handlers   (s-interr.adb)
+        │  stores User_Handler  (Ada procedure pointer)
+        │  stores Source_Arg    (interrupt source ID as a C int)
+        └─► Install_Handler (source id, Ada ceiling priority)
+              │  calls __gnat_is_valid_intr_source     (freertos.c)
+              │    └─► checks esp_isr_names[source] != NULL
+              └─► __gnat_esp_intr_alloc_c_handler      (freertos.c)
+                    │  maps Ada priority 241-255 → ESP_INTR_FLAG_LEVELn
+                    └─► esp_intr_alloc (source, flags,
+                              Interrupt_Trampoline, &Source_Args[source],
+                              &handle)           ← ESP-IDF interrupt matrix API
+```
+
+**`esp_intr_alloc`** is the central ESP-IDF function for interrupt registration.
+It programmes the Xtensa interrupt-matrix peripheral, which connects any of the
+99 peripheral interrupt sources to one of the 32 CPU interrupt lines, and
+associates a C function pointer and a single `void *` argument with that line.
+The `ESP_INTR_FLAG_LEVELn` flag tells the IDF which hardware priority level to
+request when allocating a CPU interrupt line.
+
+**`Interrupt_Trampoline`** is the C-callable function that is actually registered
+with `esp_intr_alloc`.  It receives a pointer to the source ID stored in
+`Source_Args`, looks up the corresponding Ada `Parameterless_Handler` in the
+`User_Handlers` table, and calls it.  Before dispatching to the Ada handler it
+performs one piece of housekeeping that the IDF does *not* do automatically for
+GPIO: it reads and clears the GPIO interrupt-status registers using the HAL
+primitives `gpio_ll_get_intr_status` / `gpio_ll_clear_intr_status` (from
+`hal/gpio_ll.h`).  Every other peripheral is expected to clear its own status
+register inside its own handler; GPIO is the exception because a single status
+register covers all pins simultaneously and must be cleared before re-enabling
+interrupts.
+
+```
+CPU receives interrupt (hardware)
+  │
+  └─► Interrupt_Trampoline(arg)          (s-interr.adb / C convention)
+        │  arg → Source_Args[n] → source id
+        │  if source == GPIO Core-0:
+        │    gpio_ll_get_intr_status  ──► read GPIO_STATUS_REG
+        │    gpio_ll_clear_intr_status ──► write GPIO_STATUS_W1TC_REG
+        │  User_Handlers[source_id].all  (Ada protected procedure)
+        └─► returns to FreeRTOS interrupt dispatcher
+```
+
+**`__gnat_is_valid_intr_source`** queries `esp_isr_names[]`, an IDF-internal
+table that maps each source index to a human-readable name string.  Slots that
+are reserved or do not exist on the current chip hold `NULL`; valid slots hold a
+non-NULL pointer.  This lets the runtime validate a source ID against the actual
+chip without needing any chip-specific Ada code.
+
 ## Example: GPIO0 Falling-Edge Interrupt Counter
 
 `source/gpio0_interrupt.ads` / `.adb` demonstrate the full pattern:
