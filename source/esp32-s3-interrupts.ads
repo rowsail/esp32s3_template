@@ -14,20 +14,24 @@ with Ada.Interrupts;
 
 package ESP32.S3.Interrupts is
 
+   --  Required to bring "/=" into scope for the Static_Predicate below.
    use type Ada.Interrupts.Interrupt_ID;
 
-    --  Total number of interrupt sources on the ESP32-S3.
-    Max_Interrupt_Source : constant Ada.Interrupts.Interrupt_ID := 99;
+   --  Total number of interrupt sources on the ESP32-S3.
+   Max_Interrupt_Source : constant := 99;
 
-    --  Compile-time-safe interrupt source subtype for ESP32-S3.
-    --  Reserved source IDs are excluded by the static predicate.
-    subtype Interrupt_Source is Ada.Interrupts.Interrupt_ID range 0 .. 98
-    with
-       Static_Predicate =>
-          Interrupt_Source /= 23
-          and then Interrupt_Source /= 33
-          and then Interrupt_Source /= 34
-          and then Interrupt_Source /= 46;
+   --  Compile-time-safe interrupt source subtype for the ESP32-S3.
+   --  The static predicate excludes reserved source IDs that have no
+   --  corresponding peripheral (23, 33, 34, 46).  Using a literal or
+   --  named constant from this package outside the valid set is a
+   --  compile-time error when the value is static.
+   subtype Interrupt_Source is Ada.Interrupts.Interrupt_ID range 0 .. 98
+   with
+     Static_Predicate =>
+       Interrupt_Source /= 23
+       and then Interrupt_Source /= 33
+       and then Interrupt_Source /= 34
+       and then Interrupt_Source /= 46;
 
    --  -----------------------------------------------------------------------
    --  Wireless / Bluetooth  (sources 0 .. 15)

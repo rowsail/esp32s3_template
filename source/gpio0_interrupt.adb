@@ -11,6 +11,10 @@ package body GPIO0_Interrupt is
    GPIO_Intr_Source : constant := ESP32.S3.Interrupts.GPIO_Core_0;
 
    protected GPIO0_Handler is
+      --  Ada protected-object ceiling priority.  The runtime maps the full
+      --  Interrupt_Priority range (241 .. 255) onto ESP-IDF C-callable
+      --  levels 1 .. 3; Last therefore selects level 3 (medium priority).
+      --  High-level assembly-entry levels (4/5/NMI) are never used.
       pragma Interrupt_Priority (System.Interrupt_Priority'Last);
 
       procedure On_Low;
