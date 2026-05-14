@@ -118,13 +118,13 @@ declaration is fully supported and is the idiomatic Jorvik approach.
 
 A protected object with `pragma Interrupt_Priority` and `pragma Attach_Handler` maps
 directly onto the ESP-IDF interrupt-matrix mechanism.  The runtime allocates a CPU interrupt
-slot at elaboration time via `__gnat_esp_intr_alloc_c_handler` and registers the handler —
-no dynamic binding and no calls to `esp_intr_alloc` from user code.
+slot at elaboration time and registers the handler — no dynamic binding from user code.
 
 ```ada
 protected GPIO0_Handler is
-   --  Interrupt_Priority'Last selects ESP-IDF C-callable level 3 (see below).
-   pragma Interrupt_Priority (System.Interrupt_Priority'Last);
+   --  Interrupt_Priority'First (25) selects ESP-IDF level 1 — the lowest
+   --  C-callable hardware level.  See the priority mapping table below.
+   pragma Interrupt_Priority (System.Interrupt_Priority'First);
    procedure On_Low;
    pragma Attach_Handler (On_Low, GPIO_Intr_Source);  --  static, Jorvik-safe
    function Trigger_Count return Interfaces.Unsigned_32;
@@ -138,89 +138,66 @@ the attachment is resolved entirely at compile/elaboration time.
 
 ### Interrupt priority mapping
 
-The Xtensa core has seven hardware interrupt levels, but only levels 1–3 support
-C function calls.  Levels 4, 5, and the NMI require hand-written assembly entry
-points and cannot be used with Ada protected handlers.
+The Xtensa core has seven hardware interrupt levels.  Only levels 1–3 support standard
+C calling conventions.  Levels 4–6 and NMI require hand-written assembly entry/exit
+sequences and **cannot** be used with Ada protected handlers.
 
-The runtime maps the Ada `Interrupt_Priority` range (241–255) proportionally onto
-ESP-IDF C-callable levels 1–3 in `__gnat_esp_intr_alloc_c_handler`:
+This runtime defines `System.Interrupt_Priority` as the range **25 .. 31** (7 values).
+`System.ESPIDF.To_Flags` maps each value one-to-one onto an ESP-IDF flag:
 
-| Ada `Interrupt_Priority` | ESP-IDF flag | Xtensa hardware level |
-|--------------------------|--------------|----------------------|
-| 241–245 | `ESP_INTR_FLAG_LEVEL1` | 1 (lowest) |
-| 246–250 | `ESP_INTR_FLAG_LEVEL2` | 2 |
-| 251–255 | `ESP_INTR_FLAG_LEVEL3` | 3 (highest C-callable) |
+| Ada `Interrupt_Priority` | ESP-IDF flag | Xtensa hardware level | Ada-safe? |
+|--------------------------|--------------|----------------------|-----------|
+| 25 (`'First`) | `ESP_INTR_FLAG_LEVEL1` | 1 (lowest) | ✓ |
+| 26 | `ESP_INTR_FLAG_LEVEL2` | 2 | ✓ |
+| 27 | `ESP_INTR_FLAG_LEVEL3` | 3 | ✓ |
+| 28 | `ESP_INTR_FLAG_LEVEL4` | 4 — assembly only | ✗ |
+| 29 | `ESP_INTR_FLAG_LEVEL5` | 5 — assembly only | ✗ |
+| 30 | `ESP_INTR_FLAG_LEVEL6` | 6 — assembly only | ✗ |
+| 31 (`'Last`) | `ESP_INTR_FLAG_NMI` | NMI — assembly only | ✗ |
 
-`Interrupt_Priority'Last` (255) therefore selects hardware level 3 — the highest
-priority at which a C-callable (and therefore Ada) handler can run.  Assembly-only
-levels 4/5/NMI are never selected regardless of the priority value passed in.
-
-Previous versions of the runtime ignored the priority entirely; the IDF always
-allocated a level-1 slot.  The runtime now threads the `Interrupt_Priority` value
-through `Install_Restricted_Handlers` → `Install_Handler` → the C helper, so the
-hardware level truly reflects the Ada ceiling priority declared in the protected
-object.
+Use `Interrupt_Priority'First` .. `Interrupt_Priority'First + 2` (values 25–27) for Ada
+protected handlers.  Requesting level 4 or above will compile and elaborate but the
+handler's C calling-convention entry/exit will be wrong at run time.
 
 ### How interrupt attachment reaches the ESP-IDF
 
 When the Ada runtime elaborates a package that contains a protected object with
 `pragma Attach_Handler`, it calls `System.Interrupts.Install_Restricted_Handlers`
-(implemented in `crates/espidf_gnat_runtime/source/s-interr.adb`).  That routine
+(implemented in `crates/espidf_gnat_runtime/source/s-interr__espidf.adb`).  That routine
 walks the handler array and calls `Install_Handler` once per source.  The full
 chain from Ada to silicon is:
 
 ```
 Ada protected object elaboration
   │
-  └─► System.Interrupts.Install_Restricted_Handlers   (s-interr.adb)
+  └─► System.Interrupts.Install_Restricted_Handlers   (s-interr__espidf.adb)
         │  stores User_Handler  (Ada procedure pointer)
-        │  stores Source_Arg    (interrupt source ID as a C int)
-        └─► Install_Handler (source id, Ada ceiling priority)
-              │  calls __gnat_is_valid_intr_source     (freertos.c)
-              │    └─► checks esp_isr_names[source] != NULL
-              └─► __gnat_esp_intr_alloc_c_handler      (freertos.c)
-                    │  maps Ada priority 241-255 → ESP_INTR_FLAG_LEVELn
-                    └─► esp_intr_alloc (source, flags,
-                              Interrupt_Trampoline, &Source_Args[source],
-                              &handle)           ← ESP-IDF interrupt matrix API
+        │  stores PO_Priority   (Ada Interrupt_Priority value)
+        └─► Install_Handler (Interrupt_ID)
+              └─► System.ESPIDF.esp_intr_alloc
+                    (source  => Interrupt_ID,
+                     flags   => To_Flags (PO_Priority),   -- LEVEL1..NMI
+                     handler => Default_Handler'Access,   -- C-convention trampoline
+                     arg     => To_Address (Interrupt_ID),
+                     handle  => null)
 ```
 
-**`esp_intr_alloc`** is the central ESP-IDF function for interrupt registration.
-It programmes the Xtensa interrupt-matrix peripheral, which connects any of the
-99 peripheral interrupt sources to one of the 32 CPU interrupt lines, and
-associates a C function pointer and a single `void *` argument with that line.
-The `ESP_INTR_FLAG_LEVELn` flag tells the IDF which hardware priority level to
-request when allocating a CPU interrupt line.
+**`esp_intr_alloc`** programmes the Xtensa interrupt-matrix peripheral, connecting a
+peripheral interrupt source to a CPU interrupt line and associating a C function pointer
+and a single `void *` argument with that line.
 
-**`Interrupt_Trampoline`** is the C-callable function that is actually registered
-with `esp_intr_alloc`.  It receives a pointer to the source ID stored in
-`Source_Args`, looks up the corresponding Ada `Parameterless_Handler` in the
-`User_Handlers` table, and calls it.  Before dispatching to the Ada handler it
-performs one piece of housekeeping that the IDF does *not* do automatically for
-GPIO: it reads and clears the GPIO interrupt-status registers using the HAL
-primitives `gpio_ll_get_intr_status` / `gpio_ll_clear_intr_status` (from
-`hal/gpio_ll.h`).  Every other peripheral is expected to clear its own status
-register inside its own handler; GPIO is the exception because a single status
-register covers all pins simultaneously and must be cleared before re-enabling
-interrupts.
+**`Default_Handler`** is the C-convention procedure registered with `esp_intr_alloc`.
+It receives the interrupt source ID as its argument, looks up the corresponding Ada
+`Parameterless_Handler` in the `User_Handlers` table, and calls it directly:
 
 ```
 CPU receives interrupt (hardware)
   │
-  └─► Interrupt_Trampoline(arg)          (s-interr.adb / C convention)
-        │  arg → Source_Args[n] → source id
-        │  if source == GPIO Core-0:
-        │    gpio_ll_get_intr_status  ──► read GPIO_STATUS_REG
-        │    gpio_ll_clear_intr_status ──► write GPIO_STATUS_W1TC_REG
-        │  User_Handlers[source_id].all  (Ada protected procedure)
-        └─► returns to FreeRTOS interrupt dispatcher
+  └─► Default_Handler(arg)              (s-interr__espidf.adb, Convention => C)
+        │  arg → Interrupt_ID
+        └─► User_Handlers(id).all       (Ada protected procedure, e.g. On_Low)
+              └─► returns to FreeRTOS interrupt dispatcher
 ```
-
-**`__gnat_is_valid_intr_source`** queries `esp_isr_names[]`, an IDF-internal
-table that maps each source index to a human-readable name string.  Slots that
-are reserved or do not exist on the current chip hold `NULL`; valid slots hold a
-non-NULL pointer.  This lets the runtime validate a source ID against the actual
-chip without needing any chip-specific Ada code.
 
 ## Example: GPIO0 Falling-Edge Interrupt Counter
 
@@ -241,15 +218,35 @@ chip without needing any chip-specific Ada code.
    `GPIO0` is declared as `Safe_GPIO_Pin := 0`, so a typo that produces a reserved pin
    number would be rejected at compile time.
 
-2. **Interrupt handler** — the protected procedure `On_Low` increments a counter using the
-   Ada 2022 target-name shorthand:
+2. **Interrupt handler** — the protected procedure `On_Low` clears the GPIO interrupt
+   status register then increments the counter:
 
    ```ada
+   --  ESP32-S3 GPIO_STATUS_W1TC_REG (base 0x60004000, offset 0x4C).
+   GPIO_Status_W1TC : Interfaces.Unsigned_32
+     with Volatile, Import, Convention => Ada,
+          Address => System.Storage_Elements.To_Address (16#6000_404C#);
+
    procedure On_Low is
    begin
+      GPIO_Status_W1TC := Interfaces.Shift_Left (1, Natural (GPIO0));
       Press_Count := @ + 1;
    end On_Low;
    ```
+
+   The register write is mandatory.  The GPIO peripheral aggregates interrupt status
+   for all pins in a single register (`GPIO_STATUS_REG`).  Unlike most peripherals,
+   the hardware does **not** clear that status automatically when the ISR runs — it
+   stays asserted until software writes a 1 to the corresponding bit of
+   `GPIO_STATUS_W1TC_REG` (the write-1-to-clear shadow).  If the status bit is not
+   cleared before the handler returns, the CPU re-enters the ISR immediately and
+   continuously, starving the FreeRTOS tick ISR and triggering the interrupt watchdog.
+
+   Note that the status bit can be set before `Initialize` is ever called: the GPIO
+   peripheral captures edges even while the CPU-level interrupt is masked.  Any edge
+   that occurs during the reset and boot sequence (including strapping-pin sampling)
+   will leave a pending status bit that fires the ISR the moment `esp_intr_alloc`
+   enables the CPU interrupt during elaboration.
 
 3. **Main loop** — `source/main.adb` polls `GPIO0_Interrupt.Trigger_Count` every 50 ms and
    prints a line each time the count changes:
@@ -271,18 +268,11 @@ chip without needing any chip-specific Ada code.
 Pull GPIO0 to GND to trigger the interrupt and watch the counter increment on the serial
 monitor.
 
-### Compile-time and runtime safety
+### Compile-time safety
 
-The interrupt framework provides two layers of protection against misuse:
-
-1. **Compile time** — `Interrupt_Source` carries a `Static_Predicate` that rejects the four
-   reserved IDs (23, 33, 34, 46).  A static expression that names a reserved slot is a
-   compile error, not a silent misfire.
-
-2. **Run time** — before calling `esp_intr_alloc`, the runtime checks the source ID against
-   the IDF's internal `esp_isr_names[]` table (NULL entries mark reserved slots) via
-   `__gnat_is_valid_intr_source`.  A reserved ID raises `Program_Error` rather than
-   producing undefined behaviour in the interrupt matrix.
+`Interrupt_Source` carries a `Static_Predicate` that rejects the four reserved IDs
+(23, 33, 34, 46).  A static expression that names a reserved slot is a compile error,
+not a silent misfire.
 
 > **Tip:** GPIO0 is the ESP32-S3 boot-mode strapping pin.  Most development boards (e.g.
 > ESP32-S3-DevKitC) already have a "BOOT" push button wired between GPIO0 and GND — so no
