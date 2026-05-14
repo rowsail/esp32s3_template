@@ -631,6 +631,84 @@ def postprocess(out_dir: Path) -> None:
     # Step 4: merge remaining *_types packages into their driver packages.
     _merge_all_types(out_dir)
 
+    # Step 5: replace sys_ustdint.T with direct Interfaces.C equivalents.
+    _expand_stdint(out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: replace sys_ustdint with direct Interfaces.C types
+# ---------------------------------------------------------------------------
+
+# Maps every qualified sys_ustdint.X to the corresponding Interfaces.C name.
+# With 'use Interfaces.C', these names are directly visible; only
+# Extensions.unsigned_long_long still needs the Extensions. qualifier.
+_SYS_USTDINT_EXPAND: dict[str, str] = {
+    "sys_ustdint.uint8_t":           "unsigned_char",
+    "sys_ustdint.uint16_t":          "unsigned_short",
+    "sys_ustdint.uint32_t":          "unsigned_long",
+    "sys_ustdint.uint64_t":          "Extensions.unsigned_long_long",
+    "sys_ustdint.int8_t":            "signed_char",
+    "sys_ustdint.int16_t":           "short",
+    "sys_ustdint.int32_t":           "long",
+    "sys_ustdint.int64_t":           "Long_Long_Integer",
+    "sys_ustdint.intptr_t":          "int",
+    "sys_ustdint.uintptr_t":         "unsigned",
+    "sys_ustdint.intmax_t":          "Long_Long_Integer",
+    "sys_ustdint.uintmax_t":         "Extensions.unsigned_long_long",
+    # uu_* and _least_* variants (merged in from machine_udefault_types)
+    "sys_ustdint.uu_int8_t":         "signed_char",
+    "sys_ustdint.uu_uint8_t":        "unsigned_char",
+    "sys_ustdint.uu_int16_t":        "short",
+    "sys_ustdint.uu_uint16_t":       "unsigned_short",
+    "sys_ustdint.uu_int32_t":        "long",
+    "sys_ustdint.uu_uint32_t":       "unsigned_long",
+    "sys_ustdint.uu_int64_t":        "Long_Long_Integer",
+    "sys_ustdint.uu_uint64_t":       "Extensions.unsigned_long_long",
+    "sys_ustdint.uu_int_least8_t":   "signed_char",
+    "sys_ustdint.uu_uint_least8_t":  "unsigned_char",
+    "sys_ustdint.uu_int_least16_t":  "short",
+    "sys_ustdint.uu_uint_least16_t": "unsigned_short",
+    "sys_ustdint.uu_int_least32_t":  "long",
+    "sys_ustdint.uu_uint_least32_t": "unsigned_long",
+    "sys_ustdint.uu_int_least64_t":  "Long_Long_Integer",
+    "sys_ustdint.uu_uint_least64_t": "Extensions.unsigned_long_long",
+    "sys_ustdint.uu_intmax_t":       "Long_Long_Integer",
+    "sys_ustdint.uu_uintmax_t":      "Extensions.unsigned_long_long",
+    "sys_ustdint.uu_intptr_t":       "int",
+    "sys_ustdint.uu_uintptr_t":      "unsigned",
+}
+
+
+def _expand_stdint(out_dir: Path) -> None:
+    """Replace sys_ustdint.T with direct Interfaces.C equivalents in all files."""
+    pairs = sorted(_SYS_USTDINT_EXPAND.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile("|".join(re.escape(old) for old, _ in pairs))
+    lut = dict(pairs)
+    ext_clause = "with Interfaces.C.Extensions;"
+
+    changed = 0
+    for f in sorted(out_dir.glob("*.ads")):
+        text = f.read_text()
+        new_text = pattern.sub(lambda m: lut[m.group(0)], text)
+        if new_text == text:
+            continue
+
+        new_text = re.sub(r"^with\s+sys_ustdint\s*;\n", "", new_text, flags=re.MULTILINE)
+
+        # Add 'with Interfaces.C.Extensions;' if needed and not already present.
+        if "Extensions.unsigned_long_long" in new_text and ext_clause not in new_text:
+            m = re.search(r"^package\s+", new_text, re.MULTILINE)
+            if m:
+                new_text = new_text[: m.start()] + ext_clause + "\n" + new_text[m.start():]
+
+        f.write_text(new_text)
+        changed += 1
+
+    for stem in ("sys_ustdint", "stdint"):
+        (out_dir / (stem + ".ads")).unlink(missing_ok=True)
+
+    print(f"  {changed} files expanded sys_ustdint -> Interfaces.C; sys_ustdint.ads deleted.")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
