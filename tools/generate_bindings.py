@@ -634,6 +634,11 @@ def postprocess(out_dir: Path) -> None:
     # Step 5: replace sys_ustdint.T with direct Interfaces.C equivalents.
     _expand_stdint(out_dir)
 
+    # Step 6: insert missing 'when 0 =>' in malformed variant records.
+    fixed = _fix_variant_records(out_dir)
+    if fixed:
+        print(f"  {fixed} files repaired (missing 'when 0 =>' in variant records).")
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -677,6 +682,27 @@ _SYS_USTDINT_EXPAND: dict[str, str] = {
     "sys_ustdint.uu_intptr_t":       "int",
     "sys_ustdint.uu_uintptr_t":      "unsigned",
 }
+
+
+def _fix_variant_records(out_dir: Path) -> int:
+    """Insert missing 'when 0 =>' before orphaned first variant arms.
+
+    gcc -fdump-ada-spec sometimes emits a field declaration immediately after
+    'case discr is' with no 'when X =>' guard, which is invalid Ada.
+    """
+    # Match 'case discr is\n<indent><field>' with no intervening 'when'.
+    broken = re.compile(
+        r"([ \t]*case\s+\w+\s+is\n)"   # the case line
+        r"([ \t]+)(\w+\s*:)",           # field line with no 'when' guard
+    )
+    count = 0
+    for f in sorted(out_dir.glob("*.ads")):
+        text = f.read_text()
+        new_text = broken.sub(lambda m: m.group(1) + m.group(2) + "when 0 =>\n" + m.group(2) + "   " + m.group(3), text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    return count
 
 
 def _expand_stdint(out_dir: Path) -> None:
