@@ -451,6 +451,138 @@ def _filter_system_deps(out_dir: Path) -> tuple[int, int]:
     return deleted, removed_decls
 
 
+# ---------------------------------------------------------------------------
+# Step 4: merge remaining *_types packages into driver packages
+# ---------------------------------------------------------------------------
+
+# Ordered list of (source_types_pkg, target_pkg) after the _h-suffix rename.
+# Process in this order: leaves of any chain must appear BEFORE their parent
+# so that intermediate packages receive their merged content first.
+_TYPES_MERGE: list[tuple[str, str]] = [
+    # machine types -> stdint foundation
+    ("machine_udefault_types",       "sys_ustdint"),
+    # TWAI chain (hal_twai_types -> hal_twai_types_deprecated -> driver_twai)
+    ("hal_twai_types",               "hal_twai_types_deprecated"),
+    ("hal_twai_types_deprecated",    "driver_twai"),
+    ("driver_twai_types_legacy",     "driver_twai"),
+    # HAL/driver types -> primary driver packages
+    ("hal_ana_cmpr_types",           "driver_ana_cmpr"),
+    ("hal_glitch_filter_types",      "driver_gpio_filter"),
+    ("hal_ledc_types",               "driver_ledc"),
+    ("hal_pcnt_types",               "driver_pulse_cnt"),
+    ("hal_rtc_io_types",             "driver_rtc_io"),
+    ("hal_sdm_types",                "driver_sdm"),
+    ("hal_temperature_sensor_types", "driver_temperature_sensor"),
+    ("hal_timer_types",              "driver_gptimer"),
+    ("hal_gpio_types",               "driver_gpio"),
+    ("hal_uart_types",               "driver_uart"),
+    ("hal_spi_types",                "driver_spi_common"),
+    ("driver_i2c_types",             "driver_i2c_master"),
+    ("hal_i2c_types",                "driver_i2c_master"),
+    ("driver_i2s_types",             "driver_i2s_common"),
+    ("hal_i2s_types",                "driver_i2s_common"),
+    ("driver_mcpwm_types",           "driver_mcpwm_timer"),
+    ("hal_mcpwm_types",              "driver_mcpwm_timer"),
+    ("driver_parlio_types",          "driver_parlio_tx"),
+    ("hal_parlio_types",             "driver_parlio_tx"),
+    ("driver_rmt_types",             "driver_rmt_common"),
+    ("hal_rmt_types",                "driver_rmt_common"),
+    ("esp_intr_types",               "esp_intr_alloc"),
+    # esp_lcd_types depends on hal_lcd_types, so merge esp first (middle)
+    # then hal second (top), ensuring hal types are declared before use.
+    ("esp_lcd_types",                "esp_lcd_panel_io"),
+    ("hal_lcd_types",                "esp_lcd_panel_io"),
+    ("hal_adc_types",                "esp_adc_adc_oneshot"),
+]
+
+# Files with no remaining driver references: delete without merging.
+_TYPES_ORPHAN: frozenset[str] = frozenset({
+    "hal_color_types",
+    "hal_hal_utils",
+    "esp_cpu",
+    "esp_system",
+})
+
+
+def _merge_all_types(out_dir: Path) -> None:
+    """Merge all remaining *_types packages into their respective driver packages."""
+    # Build direct map (immediate parent) for chain resolution.
+    direct: dict[str, str] = {src: dst for src, dst in _TYPES_MERGE}
+
+    def _resolve(src: str) -> str:
+        """Follow the chain to find the ultimate destination."""
+        visited = {src}
+        cur = direct.get(src, src)
+        while cur in direct and cur not in visited:
+            visited.add(cur)
+            cur = direct[cur]
+        return cur
+
+    # Step 4a: perform the actual merges in listed (topological) order.
+    merged = 0
+    for src, dst in _TYPES_MERGE:
+        types_path  = out_dir / (src + ".ads")
+        parent_path = out_dir / (dst + ".ads")
+        if not types_path.exists():
+            continue
+        if not parent_path.exists():
+            print(f"  skip   {src} -> {dst}  (parent not found)")
+            continue
+        print(f"  merge  {src} -> {dst}")
+        _merge_types_into_parent(types_path, parent_path, src, dst)
+        merged += 1
+
+    # Step 4b: build a rename map so all files update their references.
+    rename: dict[str, str] = {}
+    for src, _ in _TYPES_MERGE:
+        final = _resolve(src)
+        if final != src:
+            rename[src] = final
+
+    if rename:
+        for f in sorted(out_dir.glob("*.ads")):
+            text = f.read_text()
+            new_text = _apply_rename_map(text, rename)
+            if new_text != text:
+                f.write_text(new_text)
+
+    # After renaming, a package may end up with 'with <itself>;' or with
+    # self-qualified identifiers like 'Pkg.Type' inside the same package.
+    # Remove the self-with clause and strip the redundant self-qualifier.
+    for f in sorted(out_dir.glob("*.ads")):
+        text = f.read_text()
+        m = re.search(r"^package\s+(\S+)\s+is", text, re.MULTILINE)
+        if not m:
+            continue
+        pkg = m.group(1)
+        cleaned = re.sub(
+            r"^(?:limited\s+)?with\s+" + re.escape(pkg) + r"\s*;\n",
+            "", text, flags=re.MULTILINE,
+        )
+        # Strip self-qualified names inside the package body
+        cleaned = re.sub(r"\b" + re.escape(pkg) + r"\.(\w)", r"\1", cleaned)
+        if cleaned != text:
+            f.write_text(cleaned)
+
+    # Step 4c: delete orphaned types files and clean up their references.
+    orphan_deleted = 0
+    for stem in _TYPES_ORPHAN:
+        p = out_dir / (stem + ".ads")
+        if p.exists():
+            p.unlink()
+            orphan_deleted += 1
+
+    if orphan_deleted:
+        for f in sorted(out_dir.glob("*.ads")):
+            text = f.read_text()
+            cleaned = _drop_excl_with_clauses(text, _TYPES_ORPHAN)
+            cleaned = _drop_excl_decls(cleaned, _TYPES_ORPHAN)
+            if cleaned != text:
+                f.write_text(cleaned)
+
+    print(f"  {merged} types packages merged, {orphan_deleted} orphans removed.")
+
+
 def postprocess(out_dir: Path) -> None:
     """Merge _types_h packages into parents, drop _h suffix, filter system deps."""
     ads_files = sorted(out_dir.glob("*.ads"))
@@ -495,6 +627,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 3: remove system/OS/logging packages and clean their references.
     deleted, cleaned = _filter_system_deps(out_dir)
     print(f"  {deleted} system files removed, {cleaned} files cleaned of system references.")
+
+    # Step 4: merge remaining *_types packages into their driver packages.
+    _merge_all_types(out_dir)
 
 
 # ---------------------------------------------------------------------------
