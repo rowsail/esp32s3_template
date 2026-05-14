@@ -648,6 +648,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 9: rename anon_arrayNNN types to field-name-based names.
     _rename_anon_arrays(out_dir)
 
+    # Step 10: rename anon_structNNN types to parent-record-based names.
+    _rename_anon_structs(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1463,6 +1466,110 @@ def _rename_anon_arrays(out_dir: Path) -> int:
             f.write_text(new_text)
             count += 1
     print(f'  {count} files had anon_array types renamed.')
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Step 10: rename anon_structNNN types to parent-record-based names
+# ---------------------------------------------------------------------------
+
+def _rename_anon_structs_in_file(text: str) -> str:
+    """Rename anon_structNNN types to descriptive names within one file."""
+    struct_re = re.compile(r'\btype\s+(anon_struct\d+)\s+is\s+record\b')
+    struct_names = [m.group(1) for m in struct_re.finditer(text)]
+    if not struct_names:
+        return text
+
+    # Map record_name -> body text for parent lookup.
+    record_body: dict[str, str] = {}
+    for m in re.finditer(
+        r'type\s+(\w+)(?:\s*\([^)]*\))?\s+is\s+(?:record|null record)\b(.*?)end\s+record\b',
+        text, re.DOTALL,
+    ):
+        record_body[m.group(1)] = m.group(2)
+
+    def find_parent(sname: str) -> str | None:
+        for rname, rbody in record_body.items():
+            if re.search(r'\w+\s*:\s*aliased\s+' + re.escape(sname) + r'\b', rbody):
+                return rname
+        return None
+
+    def field_referencing(sname: str) -> str | None:
+        fields = re.findall(r'(\w+)\s*:\s*aliased\s+' + re.escape(sname) + r'\b', text)
+        return fields[0] if fields else None
+
+    # Compute proposed name for each anon_struct.
+    proposed: dict[str, str] = {}
+    for sname in struct_names:
+        fname = field_referencing(sname)
+        if fname is None:
+            continue
+
+        is_anon_field = bool(re.match(r'^anon\d+$', fname))
+
+        if is_anon_field:
+            parent = find_parent(sname)
+            if parent is None:
+                continue
+            if re.match(r'anon_(?:union|struct)\d+', parent):
+                grandparent = find_parent(parent)
+                stem = re.sub(r'_t$', '', grandparent) if grandparent else re.sub(r'_t$', '', parent)
+            else:
+                stem = re.sub(r'_t$', '', parent)
+            proposed[sname] = stem + '_fields_t'
+        else:
+            same_field = [s for s in struct_names if field_referencing(s) == fname]
+            if len(same_field) == 1:
+                proposed[sname] = fname + '_t'
+            else:
+                parent = find_parent(sname)
+                if parent is None:
+                    proposed[sname] = fname + '_t'
+                    continue
+                if re.match(r'anon_(?:union|struct)\d+', parent):
+                    grandparent = find_parent(parent)
+                    stem = re.sub(r'_t$', '', grandparent) if grandparent else re.sub(r'_t$', '', parent)
+                else:
+                    stem = re.sub(r'_t$', '', parent)
+                proposed[sname] = f'{stem}_{fname}_t'
+
+    # Resolve naming collisions: lower-numbered struct keeps the base name;
+    # subsequent ones get a numeric suffix (e.g. _fields2_t).
+    name_groups: dict[str, list[str]] = {}
+    for sname, pname in proposed.items():
+        name_groups.setdefault(pname, []).append(sname)
+
+    renames: dict[str, str] = {}
+    for pname, group in name_groups.items():
+        sorted_group = sorted(group, key=lambda s: int(re.search(r'\d+', s).group()))
+        renames[sorted_group[0]] = pname
+        base = pname[: -len('_t')]
+        for i, sn in enumerate(sorted_group[1:], 2):
+            renames[sn] = f'{base}{i}_t'
+
+    if not renames:
+        return text
+
+    rename_pairs = sorted(renames.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])('
+        + '|'.join(re.escape(old) for old, _ in rename_pairs)
+        + r')(?![A-Za-z0-9_])',
+    )
+    lut = dict(rename_pairs)
+    return pattern.sub(lambda m: lut[m.group(1)], text)
+
+
+def _rename_anon_structs(out_dir: Path) -> int:
+    """Step 10: rename anon_structNNN types to parent-record-based names."""
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text = _rename_anon_structs_in_file(text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had anon_struct types renamed.')
     return count
 
 
