@@ -3,22 +3,22 @@
 Generate Ada thin bindings for ESP32-S3 IDF peripherals.
 
 Usage:
-    python3 tools/generate_bindings.py [--idf-path PATH] [--out-dir DIR] [--gcc PATH]
+    python3 tools/generate_bindings.py [--out-dir DIR] [--gcc PATH]
     python3 tools/generate_bindings.py --module ESP32.GPIO
 
 The script reads tools/modules.toml, then for each enabled module calls
 `gcc -fdump-ada-spec` on the listed IDF headers.  All generated .ads files
 (direct bindings and transitive C-header dependencies) are written to
-source/idf/.  Files already present are skipped so running the script a
-second time is idempotent.
+source/idf/.
 
-Package naming follows the gcc convention:
-  driver/gpio.h            -> package driver_gpio_h     in driver_gpio_h.ads
-  esp_adc/adc_oneshot.h    -> package esp_adc_adc_oneshot_h
+After generation, a post-processing pass:
+  * Merges *_types_h packages into their parent *_h package (when present).
+  * Drops the trailing _h suffix from every package name and file name.
+  * Updates all with-clauses and qualified names throughout every file.
 
-Users write e.g.:
-  with driver_gpio_h;  use driver_gpio_h;
-  with driver_rmt_tx_h; use driver_rmt_tx_h;
+Final package names:
+  driver/gpio.h         -> package driver_gpio   in driver_gpio.ads
+  esp_adc/adc_oneshot.h -> package esp_adc_adc_oneshot
 
 Requirements:
   - Run 'idf.py build' at least once so build/compile_commands.json exists.
@@ -27,7 +27,6 @@ Requirements:
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -52,6 +51,10 @@ DEFAULT_GCC = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Compiler / include-path helpers
+# ---------------------------------------------------------------------------
+
 def find_gcc(explicit: str | None) -> Path:
     if explicit:
         p = Path(explicit)
@@ -70,11 +73,7 @@ def find_gcc(explicit: str | None) -> Path:
 
 
 def extract_include_flags(compile_commands: Path) -> tuple[list[str], Path | None]:
-    """Return (deduplicated -I flags, idf_path) from compile_commands.json.
-
-    idf_path is inferred from the first component path seen in the flags,
-    or None if it cannot be determined.
-    """
+    """Return (deduplicated -I flags, idf_path) from compile_commands.json."""
     if not compile_commands.exists():
         sys.exit(
             f"{compile_commands} not found.\n"
@@ -88,13 +87,8 @@ def extract_include_flags(compile_commands: Path) -> tuple[list[str], Path | Non
     idf_path: Path | None = None
 
     for entry in db:
-        # compile_commands.json may use either 'arguments' (list) or 'command' (string)
         raw = entry.get("arguments")
-        if raw:
-            args = raw
-        else:
-            args = entry.get("command", "").split()
-
+        args = raw if raw else entry.get("command", "").split()
         i = 0
         while i < len(args):
             if args[i] == "-I" and i + 1 < len(args):
@@ -112,7 +106,6 @@ def extract_include_flags(compile_commands: Path) -> tuple[list[str], Path | Non
             else:
                 i += 1
 
-    # Infer IDF root from any path that matches .../components/<name>/include
     if idf_path is None:
         for inc in seen:
             p = Path(inc)
@@ -128,15 +121,8 @@ def extract_include_flags(compile_commands: Path) -> tuple[list[str], Path | Non
 _EXCLUDED_COMPONENTS = frozenset({"linux", "esp_linux_helper"})
 
 
-def add_idf_component_includes(
-    base_flags: list[str], idf_path: Path
-) -> list[str]:
-    """Add all components/*/include directories from the IDF tree.
-
-    This ensures headers from driver components not used by the current
-    app (e.g. driver/uart.h) can still be found.  Linux-host-only
-    component paths are excluded because they shadow Xtensa toolchain headers.
-    """
+def add_idf_component_includes(base_flags: list[str], idf_path: Path) -> list[str]:
+    """Add all components/*/include directories from the IDF tree."""
     seen: set[str] = {f[2:] for f in base_flags if f.startswith("-I")}
     extra: list[str] = []
     components_dir = idf_path / "components"
@@ -145,7 +131,6 @@ def add_idf_component_includes(
     for inc_dir in sorted(components_dir.rglob("include")):
         if not inc_dir.is_dir():
             continue
-        # Determine the component this include dir belongs to.
         try:
             rel = inc_dir.relative_to(components_dir)
             component_name = rel.parts[0]
@@ -159,27 +144,20 @@ def add_idf_component_includes(
     return base_flags + extra
 
 
-def header_to_package_name(header: str) -> str:
-    """Predict the Ada package name gcc will use for a C header path.
+# ---------------------------------------------------------------------------
+# Binding generation
+# ---------------------------------------------------------------------------
 
-    driver/gpio.h         -> driver_gpio_h
-    esp_adc/adc_oneshot.h -> esp_adc_adc_oneshot_h
-    """
+def header_to_package_name(header: str) -> str:
+    """Predict the Ada package name gcc will use for a C header path."""
     name = header.lower()
-    # strip .h suffix, replace path separators and dashes with underscores
     name = re.sub(r"\.h$", "_h", name)
     name = re.sub(r"[/\-\.]", "_", name)
     return name
 
 
-def dump_ada_spec(
-    gcc: Path,
-    header: str,
-    include_flags: list[str],
-    work_dir: Path,
-) -> list[Path]:
+def dump_ada_spec(gcc: Path, header: str, include_flags: list[str], work_dir: Path) -> list[Path]:
     """Run gcc -fdump-ada-spec on a single header; return all produced .ads files."""
-    # Write a tiny wrapper so we control the exact file fed to gcc.
     wrapper = work_dir / "_wrap_.h"
     wrapper.write_text(f"#include <{header}>\n")
 
@@ -190,16 +168,12 @@ def dump_ada_spec(
     )
     result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True)
     if result.returncode != 0:
-        stderr_tail = result.stderr[-1500:]
         raise RuntimeError(
             f"gcc -fdump-ada-spec failed for {header} (exit {result.returncode}):\n"
-            f"{stderr_tail}"
+            f"{result.stderr[-1500:]}"
         )
 
-    # Remove the wrapper's own (always-empty) .ads file.
-    wrapper_ads = work_dir / "_wrap__h.ads"
-    wrapper_ads.unlink(missing_ok=True)
-
+    (work_dir / "_wrap__h.ads").unlink(missing_ok=True)
     return sorted(work_dir.glob("*.ads"))
 
 
@@ -207,14 +181,8 @@ _ABS_PATH_RE = re.compile(r"--\s+/[^\s]+")
 
 
 def strip_abs_paths(text: str) -> str:
-    """Remove absolute filesystem paths from generated Ada comments.
-
-    gcc -fdump-ada-spec appends the source file path as a trailing comment on
-    each declaration line.  Remove those and tidy up trailing whitespace so the
-    output is clean and machine-independent.
-    """
+    """Remove machine-specific absolute paths from generated Ada comments."""
     text = _ABS_PATH_RE.sub("", text)
-    # Clean up trailing whitespace left behind after path removal.
     text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
     return text
 
@@ -242,9 +210,7 @@ def generate_module(
     headers     = module["headers"]
     print(f"\n  {ada_package}")
 
-    total_new    = 0
-    total_skipped = 0
-    failed       = 0
+    total_new = total_skipped = failed = 0
 
     for header in headers:
         pkg_name = header_to_package_name(header)
@@ -262,32 +228,179 @@ def generate_module(
             new = skipped = 0
             for ads in ads_files:
                 n, s = install_ads(ads, out_dir, already_written)
-                new     += n
-                skipped += s
+                new += n; skipped += s
 
-            total_new     += new
-            total_skipped += skipped
+            total_new += new; total_skipped += skipped
             print(f"  [{new} new, {skipped} skipped]")
 
     return total_new, failed
 
 
+# ---------------------------------------------------------------------------
+# Post-processing: merge _types_h packages and drop _h suffix
+# ---------------------------------------------------------------------------
+
+def _pkg_body(text: str, pkg: str) -> str:
+    """Extract everything between 'package PKG is' and 'end PKG;'."""
+    m = re.search(
+        r"^package\s+" + re.escape(pkg) + r"\s+is\n(.*?)\nend\s+" + re.escape(pkg) + r"\s*;",
+        text, re.DOTALL | re.MULTILINE,
+    )
+    return m.group(1) if m else ""
+
+
+def _with_lines(text: str) -> list[str]:
+    """Return context-clause lines (with/limited-with/use) from the file header.
+
+    Only lines that appear before 'package ... is' are considered; this avoids
+    matching 'with Convention => C' or similar record-component syntax.
+    """
+    result = []
+    for ln in text.splitlines():
+        if re.match(r"^package\s+", ln):
+            break
+        if re.match(r"\s*(limited\s+)?with\s+\w|\s*use\s+\w", ln):
+            result.append(ln)
+    return result
+
+
+def _merge_types_into_parent(types_path: Path, parent_path: Path,
+                              types_pkg: str, parent_pkg: str) -> None:
+    """Inline the content of types_path into parent_path and delete types_path."""
+    types_text  = types_path.read_text()
+    parent_text = parent_path.read_text()
+
+    body = _pkg_body(types_text, types_pkg)
+
+    # Add any new with-clauses from the types file (skip self-references).
+    for wl in _with_lines(types_text):
+        ref = re.match(r"\s*(?:limited\s+)?with\s+(\S+?)(?:,|\s*;)", wl)
+        if ref and ref.group(1) in (types_pkg, parent_pkg):
+            continue
+        if wl.strip() not in parent_text:
+            m = re.search(r"^package\s+", parent_text, re.MULTILINE)
+            if m:
+                parent_text = parent_text[: m.start()] + wl + "\n" + parent_text[m.start():]
+
+    # Remove the 'with <types_pkg>;' line from the parent (it's now inlined).
+    parent_text = re.sub(
+        r"^(?:limited\s+)?with\s+" + re.escape(types_pkg) + r"\s*;\n",
+        "", parent_text, flags=re.MULTILINE,
+    )
+    parent_text = re.sub(
+        r"^use\s+" + re.escape(types_pkg) + r"\s*;\n",
+        "", parent_text, flags=re.MULTILINE,
+    )
+
+    if body.strip():
+        # Types must come before they are used, so insert at the TOP of the
+        # parent package body (immediately after 'package X is').
+        open_m = re.search(
+            r"^package\s+" + re.escape(parent_pkg) + r"\s+is\n",
+            parent_text, re.MULTILINE,
+        )
+        if open_m:
+            insert = open_m.end()
+            parent_text = parent_text[:insert] + body + "\n\n" + parent_text[insert:]
+
+    parent_path.write_text(parent_text)
+    types_path.unlink()
+
+
+def _build_rename_map(stems: set[str]) -> dict[str, str]:
+    """Map every old package/file stem to its new name.
+
+    Rules:
+      *_types_h  where *_h exists  ->  * (merged; same new name as parent)
+      *_types_h  standalone        ->  *_types  (drop _h only)
+      *_h                          ->  *        (drop _h)
+      anything else                ->  unchanged
+    """
+    rename: dict[str, str] = {}
+    for stem in stems:
+        if stem.endswith("_types_h"):
+            parent = stem[: -len("_types_h")] + "_h"
+            if parent in stems:
+                rename[stem] = parent[:-2]   # merged: both point to same new name
+            else:
+                rename[stem] = stem[:-2]     # standalone: drop just _h
+        elif stem.endswith("_h"):
+            rename[stem] = stem[:-2]
+        else:
+            rename[stem] = stem
+    return rename
+
+
+def _apply_rename_map(text: str, rename: dict[str, str]) -> str:
+    """Replace every old package identifier with its new name in one pass."""
+    pairs = sorted(rename.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])("
+        + "|".join(re.escape(old) for old, _ in pairs)
+        + r")(?![A-Za-z0-9_])"
+    )
+    lut = dict(pairs)
+    return pattern.sub(lambda m: lut[m.group(1)], text)
+
+
+def postprocess(out_dir: Path) -> None:
+    """Merge _types_h packages into parents, then drop _h from all names."""
+    ads_files = sorted(out_dir.glob("*.ads"))
+    stems = {f.stem for f in ads_files}
+
+    rename = _build_rename_map(stems)
+
+    # Step 1: merge types files that have a parent.
+    merged_count = 0
+    for stem in sorted(stems):
+        if not stem.endswith("_types_h"):
+            continue
+        parent = stem[: -len("_types_h")] + "_h"
+        if parent not in stems:
+            continue
+        types_path  = out_dir / (stem   + ".ads")
+        parent_path = out_dir / (parent + ".ads")
+        print(f"  merge  {stem} -> {parent}")
+        _merge_types_into_parent(types_path, parent_path, stem, parent)
+        merged_count += 1
+
+    # Step 2: rename every remaining file and update all identifiers inside.
+    renamed_count = 0
+    for f in sorted(out_dir.glob("*.ads")):
+        old_stem = f.stem
+        new_stem = rename.get(old_stem, old_stem)
+
+        text     = f.read_text()
+        new_text = _apply_rename_map(text, rename)
+
+        new_path = out_dir / (new_stem + ".ads")
+        if new_path == f:
+            if new_text != text:
+                f.write_text(new_text)
+        else:
+            new_path.write_text(new_text)
+            f.unlink()
+            renamed_count += 1
+
+    print(f"  {merged_count} types files merged, {renamed_count} files renamed.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--out-dir",
-        default=str(OUT_DIR),
+        "--out-dir", default=str(OUT_DIR),
         help=f"Output directory for .ads files (default: {OUT_DIR})",
     )
     parser.add_argument(
-        "--gcc",
-        default=None,
+        "--gcc", default=None,
         help="Path to xtensa-esp32-elf-gcc (auto-detected if not given)",
     )
     parser.add_argument(
-        "--module",
-        metavar="ADA_PACKAGE",
-        default=None,
+        "--module", metavar="ADA_PACKAGE", default=None,
         help="Generate only this module (e.g. ESP32.GPIO). Default: all enabled.",
     )
     args = parser.parse_args()
@@ -320,19 +433,19 @@ def main() -> None:
     print(f"Output   : {out_dir}")
 
     already_written: set[str] = set()
-    total_new  = 0
-    total_fail = 0
+    total_new = total_fail = 0
 
     for module in modules:
-        new, fail = generate_module(
-            module, gcc, include_flags, out_dir, already_written
-        )
-        total_new  += new
-        total_fail += fail
+        new, fail = generate_module(module, gcc, include_flags, out_dir, already_written)
+        total_new += new; total_fail += fail
 
-    print(f"\nDone: {total_new} .ads files written, {total_fail} header(s) failed.")
+    print(f"\nGenerated: {total_new} .ads files, {total_fail} header(s) failed.")
     if total_fail:
         sys.exit(1)
+
+    print("\nPost-processing:")
+    postprocess(out_dir)
+    print("Done.")
 
 
 if __name__ == "__main__":
