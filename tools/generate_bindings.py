@@ -645,6 +645,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 8: convert pseudo-enum subtypes to proper Ada enumeration types.
     _expand_pseudo_enums(out_dir)
 
+    # Step 9: rename anon_arrayNNN types to field-name-based names.
+    _rename_anon_arrays(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1417,6 +1420,50 @@ def _expand_pseudo_enums(out_dir: Path) -> int:
 
     print(f'  {changed} files had pseudo-enums converted to proper Ada enum types.')
     return changed
+
+
+# ---------------------------------------------------------------------------
+# Step 9: rename anon_arrayNNN types to field-name-based names
+# ---------------------------------------------------------------------------
+
+def _rename_anon_arrays_in_file(text: str) -> str:
+    """Rename anon_arrayNNN types to {first_field_name}_t within one file."""
+    array_re = re.compile(r'\btype\s+(anon_array\d+)\s+is\s+array\b')
+    renames: dict[str, str] = {}
+
+    for m in array_re.finditer(text):
+        aname = m.group(1)
+        fields = re.findall(
+            r'(\w+)\s*:\s*aliased\s+' + re.escape(aname) + r'\b',
+            text,
+        )
+        if fields:
+            renames[aname] = fields[0] + '_t'
+
+    if not renames:
+        return text
+
+    rename_pairs = sorted(renames.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])('
+        + '|'.join(re.escape(old) for old, _ in rename_pairs)
+        + r')(?![A-Za-z0-9_])',
+    )
+    lut = dict(rename_pairs)
+    return pattern.sub(lambda m: lut[m.group(1)], text)
+
+
+def _rename_anon_arrays(out_dir: Path) -> int:
+    """Step 9: rename anon_arrayNNN types to field-name-based names."""
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text = _rename_anon_arrays_in_file(text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had anon_array types renamed.')
+    return count
 
 
 def _expand_stdint(out_dir: Path) -> None:
