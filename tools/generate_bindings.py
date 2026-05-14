@@ -1248,9 +1248,24 @@ def _expand_arg_macros(out_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _is_bitmask_values(values: list[int]) -> bool:
-    """Return True if there are 2+ distinct non-zero values and all are powers of two."""
+    """Return True if there are 3+ distinct non-zero values and all are powers of two."""
     non_zero = list({v for v in values if v != 0})
-    return len(non_zero) > 1 and all(v > 0 and (v & (v - 1)) == 0 for v in non_zero)
+    return len(non_zero) >= 3 and all(v > 0 and (v & (v - 1)) == 0 for v in non_zero)
+
+
+def _gen_modular_type_decl(
+    type_name: str,
+    entries: list[tuple[str, str, int]],
+    indent: str,
+) -> str:
+    """Generate Ada modular type + named constants (for bitmask C enums)."""
+    lines = [
+        f'{indent}type {type_name} is mod 2**32',
+        f'{indent}with Convention => C;',
+    ]
+    for _, literal, value in entries:
+        lines.append(f'{indent}{literal} : constant {type_name} := {value};')
+    return '\n'.join(lines)
 
 
 def _gen_enum_type_decl(
@@ -1332,32 +1347,30 @@ def _convert_pseudo_enums_in_file(text: str) -> tuple[str, dict[str, str]]:
         if any(v > 2_147_483_647 or v < -2_147_483_648 for v in values):
             continue
 
-        # Skip genuine bitmask types (multiple distinct non-zero powers of two).
-        if _is_bitmask_values(values):
-            continue
-
-        conversions.append((indent, type_name, entries))
+        conversions.append((indent, type_name, entries, _is_bitmask_values(values)))
 
     if not conversions:
         return text, {}
 
-    for indent, type_name, entries in conversions:
-        seen: dict[int, str] = {}
-        canonical: list[tuple[str, int]] = []
-        duplicates: list[tuple[str, int]] = []
-        for _, literal, value in entries:
-            if value not in seen:
-                seen[value] = literal
-                canonical.append((literal, value))
-            else:
-                duplicates.append((literal, value))
-
-        canonical.sort(key=lambda x: x[1])
-
+    for indent, type_name, entries, is_bitmask in conversions:
         for full_name, literal, _ in entries:
             rename_map[full_name] = literal
 
-        new_decl = _gen_enum_type_decl(type_name, canonical, duplicates, indent)
+        if is_bitmask:
+            new_decl = _gen_modular_type_decl(type_name, entries, indent)
+        else:
+            seen: dict[int, str] = {}
+            canonical: list[tuple[str, int]] = []
+            duplicates: list[tuple[str, int]] = []
+            for _, literal, value in entries:
+                if value not in seen:
+                    seen[value] = literal
+                    canonical.append((literal, value))
+                else:
+                    duplicates.append((literal, value))
+
+            canonical.sort(key=lambda x: x[1])
+            new_decl = _gen_enum_type_decl(type_name, canonical, duplicates, indent)
 
         text = re.sub(
             r'^[ \t]*subtype\s+' + re.escape(type_name) + r'\s+is\s+unsigned\s*;\n',
