@@ -654,6 +654,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 11: rename anon_unionNNN types to own-field-based names.
     _rename_anon_unions(out_dir)
 
+    # Step 12: rename anon<N> field names to type-derived names.
+    _rename_anon_fields(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1692,6 +1695,50 @@ def _rename_anon_unions(out_dir: Path) -> int:
             f.write_text(new_text)
             count += 1
     print(f'  {count} files had anon_union types renamed.')
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Step 12: rename anon<N> field names to type-derived names
+# ---------------------------------------------------------------------------
+
+def _rename_anon_fields_in_file(text: str) -> str:
+    """Rename anon<N> record field names to the type name with _t stripped."""
+    # Find every  anon<N> : aliased TypeName  in any record body.
+    field_re = re.compile(
+        r'(?<![A-Za-z0-9_])(anon\d+)\s*:\s*aliased\s+(\w+)\b'
+    )
+    renames: dict[str, str] = {}
+    for m in field_re.finditer(text):
+        old_field = m.group(1)
+        type_name = m.group(2)
+        new_field = re.sub(r'_t$', '', type_name)
+        if new_field != old_field:
+            renames[old_field] = new_field
+
+    if not renames:
+        return text
+
+    rename_pairs = sorted(renames.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])('
+        + '|'.join(re.escape(old) for old, _ in rename_pairs)
+        + r')(?![A-Za-z0-9_])',
+    )
+    lut = dict(rename_pairs)
+    return pattern.sub(lambda m: lut[m.group(1)], text)
+
+
+def _rename_anon_fields(out_dir: Path) -> int:
+    """Step 12: rename anon<N> record field names to type-derived names."""
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text = _rename_anon_fields_in_file(text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had anon field names renamed.')
     return count
 
 
