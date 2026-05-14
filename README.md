@@ -8,6 +8,25 @@ It allows you to leverage the robust drivers and RTOS capabilities of the ESP-ID
 The example application demonstrates GPIO input with a falling-edge interrupt handler,
 written entirely in Ada using the Jorvik real-time profile.
 
+## Cloning
+
+This repository uses Git submodules for its Ada runtime and tooling
+(`crates/espidf_gnat_runtime`, `crates/bb-runtimes`, `crates/a0b-tools`,
+`crates/xtensa-dynconfig`).  A plain `git clone` leaves those directories
+empty, so the build will fail with missing source files.
+
+Clone with submodules in one step:
+
+```bash
+git clone --recurse-submodules git@github.com:rowsail/esp32s3_template.git
+```
+
+If you have already cloned without the flag, populate the submodules afterwards:
+
+```bash
+git submodule update --init --recursive
+```
+
 ## Project Architecture
 
 Instead of a standalone Ada executable, this project compiles Ada source into a encapsulated static library that is linked into the final ESP-IDF project.
