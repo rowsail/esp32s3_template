@@ -343,8 +343,116 @@ def _apply_rename_map(text: str, rename: dict[str, str]) -> str:
     return pattern.sub(lambda m: lut[m.group(1)], text)
 
 
+# ---------------------------------------------------------------------------
+# System-dependency filtering
+# ---------------------------------------------------------------------------
+
+# Packages that are purely C-runtime / OS / logging infrastructure and have
+# no place in a peripheral hardware API binding.  The _h suffix has already
+# been dropped by the rename pass when this set is consulted.
+_SYSTEM_PKGS: frozenset[str] = frozenset({
+    # C standard library
+    "assert", "stdio", "stdlib", "string", "strings", "stdarg", "inttypes",
+    # C-library internals (newlib / musl reentrant structs)
+    "sys_reent", "sys_utypes", "sys_ulocale", "sys_lock", "lock", "reent",
+    # Low-level synchronisation (not part of the driver API surface)
+    "spinlock",
+    # FreeRTOS scheduler internals (TickType_t lives in freertos_portmacro
+    # which is deliberately kept so TWAI/UART timeouts remain typed)
+    "freertos_freertos", "freertos_projdefs", "freertos_list",
+    "freertos_portable", "freertos_task", "freertos_queue",
+    "freertos_semphr", "freertos_event_groups", "freertos_timers",
+    "freertos_stream_buffer", "freertos_message_buffer",
+    "freertos_idf_additions",
+    # Xtensa CPU internals
+    "xtensa_api", "xtensa_config_core", "xtensa_context", "xtensa_hal",
+    "xtensa_xtruntime", "xtensa_xtruntime_core_state",
+    "xtensa_xtruntime_frames", "xt_utils",
+    # ESP-IDF system services that are not peripheral access
+    "esp_log", "esp_log_args", "esp_log_buffer", "esp_log_config",
+    "esp_log_level", "esp_log_timestamp", "esp_log_write",
+    "esp_heap_caps", "multi_heap",
+    "esp_idf_version", "esp_ipc",
+    "esp_memory_utils", "esp_newlib",
+    "esp_private_crosscore_int", "esp_rom_sys",
+    # Stray / internal
+    "uwrap_uh",
+})
+
+
+def _drop_excl_with_clauses(text: str, excl: frozenset[str]) -> str:
+    """Remove 'with/limited with/use EXCL_PKG;' lines from the file header."""
+    lines = text.splitlines(keepends=True)
+    past_pkg = False
+    result = []
+    for ln in lines:
+        if not past_pkg and re.match(r"^package\s+", ln):
+            past_pkg = True
+        if not past_pkg:
+            m = re.match(r"\s*(?:limited\s+)?with\s+(\w+)", ln)
+            if m and m.group(1) in excl:
+                continue
+            m = re.match(r"\s*use\s+(\w+)", ln)
+            if m and m.group(1) in excl:
+                continue
+        result.append(ln)
+    return "".join(result)
+
+
+def _drop_excl_decls(text: str, excl: frozenset[str]) -> str:
+    """Remove declaration blocks whose text references any excluded package.
+
+    A 'declaration block' is a run of non-blank lines (one declaration with
+    its aspect specification) separated from its neighbours by blank lines.
+    The package header and footer are left untouched.
+    """
+    if not excl:
+        return text
+
+    excl_re = re.compile(
+        r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(p) for p in sorted(excl, key=len, reverse=True)) + r")\."
+    )
+
+    pkg_open = re.search(r"^package\s+\S+\s+is\s*$", text, re.MULTILINE)
+    pkg_end  = re.search(r"^end\s+\S+\s*;",          text, re.MULTILINE)
+    if not pkg_open or not pkg_end:
+        return text
+
+    header = text[: pkg_open.end() + 1]
+    body   = text[pkg_open.end() + 1 : pkg_end.start()]
+    footer = text[pkg_end.start() :]
+
+    # Split on one-or-more consecutive blank lines.
+    blocks = re.split(r"\n{2,}", body)
+    kept   = [b for b in blocks if not excl_re.search(b)]
+    return header + "\n\n".join(kept) + footer
+
+
+def _filter_system_deps(out_dir: Path) -> tuple[int, int]:
+    """Delete system-package .ads files and clean up references in kept files."""
+    deleted = removed_decls = 0
+
+    # Delete the excluded files themselves.
+    for f in sorted(out_dir.glob("*.ads")):
+        if f.stem in _SYSTEM_PKGS:
+            f.unlink()
+            deleted += 1
+
+    # In each remaining file, remove with-clauses and declarations that
+    # reference excluded packages.
+    for f in sorted(out_dir.glob("*.ads")):
+        text = f.read_text()
+        cleaned = _drop_excl_with_clauses(text, _SYSTEM_PKGS)
+        cleaned = _drop_excl_decls(cleaned, _SYSTEM_PKGS)
+        if cleaned != text:
+            removed_decls += 1
+            f.write_text(cleaned)
+
+    return deleted, removed_decls
+
+
 def postprocess(out_dir: Path) -> None:
-    """Merge _types_h packages into parents, then drop _h from all names."""
+    """Merge _types_h packages into parents, drop _h suffix, filter system deps."""
     ads_files = sorted(out_dir.glob("*.ads"))
     stems = {f.stem for f in ads_files}
 
@@ -383,6 +491,10 @@ def postprocess(out_dir: Path) -> None:
             renamed_count += 1
 
     print(f"  {merged_count} types files merged, {renamed_count} files renamed.")
+
+    # Step 3: remove system/OS/logging packages and clean their references.
+    deleted, cleaned = _filter_system_deps(out_dir)
+    print(f"  {deleted} system files removed, {cleaned} files cleaned of system references.")
 
 
 # ---------------------------------------------------------------------------
