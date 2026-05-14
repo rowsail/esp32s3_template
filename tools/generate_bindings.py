@@ -657,6 +657,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 12: rename anon<N> field names to type-derived names.
     _rename_anon_fields(out_dir)
 
+    # Step 13: convert zero-parameter expression functions to constants.
+    _nullary_funcs_to_constants(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1739,6 +1742,40 @@ def _rename_anon_fields(out_dir: Path) -> int:
             f.write_text(new_text)
             count += 1
     print(f'  {count} files had anon field names renamed.')
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Step 13: convert zero-parameter expression functions to constants
+# ---------------------------------------------------------------------------
+
+def _nullary_funcs_to_constants_in_file(text: str) -> str:
+    """Convert  function NAME return T is\n  (BODY);  to  NAME : constant T := BODY;"""
+    func_re = re.compile(
+        r'^([ \t]*)function\s+(\w+)\s+return\s+([\w.]+)\s+is\n'
+        r'([ \t]*)\((.+)\);$',
+        re.MULTILINE,
+    )
+    def _replace(m: re.Match) -> str:
+        indent      = m.group(1)
+        name        = m.group(2)
+        ret_type    = m.group(3)
+        body_indent = m.group(4)
+        body        = m.group(5)
+        return f'{indent}{name} : constant {ret_type} :=\n{body_indent}{body};'
+    return func_re.sub(_replace, text)
+
+
+def _nullary_funcs_to_constants(out_dir: Path) -> int:
+    """Step 13: convert zero-parameter expression functions to constants."""
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text = _nullary_funcs_to_constants_in_file(text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had nullary expression functions converted to constants.')
     return count
 
 
