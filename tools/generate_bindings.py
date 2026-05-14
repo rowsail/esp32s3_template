@@ -651,6 +651,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 10: rename anon_structNNN types to parent-record-based names.
     _rename_anon_structs(out_dir)
 
+    # Step 11: rename anon_unionNNN types to own-field-based names.
+    _rename_anon_unions(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1570,6 +1573,125 @@ def _rename_anon_structs(out_dir: Path) -> int:
             f.write_text(new_text)
             count += 1
     print(f'  {count} files had anon_struct types renamed.')
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Step 11: rename anon_unionNNN types to own-field-based names
+# ---------------------------------------------------------------------------
+
+def _rename_anon_unions_in_file(text: str) -> str:
+    """Rename anon_unionNNN types to descriptive names within one file."""
+    union_re = re.compile(r'\btype\s+(anon_union\d+)\s*(?:\([^)]*\))?\s+is\s+record\b')
+    union_names = [m.group(1) for m in union_re.finditer(text)]
+    if not union_names:
+        return text
+
+    # Map record_name -> body text for parent lookup.
+    record_body: dict[str, str] = {}
+    for m in re.finditer(
+        r'type\s+(\w+)(?:\s*\([^)]*\))?\s+is\s+(?:record|null record)\b(.*?)end\s+record\b',
+        text, re.DOTALL,
+    ):
+        record_body[m.group(1)] = m.group(2)
+
+    # Track all type names so we can detect clashes with existing types and
+    # between union renames as we assign them.
+    reserved: set[str] = set(re.findall(r'^\s+type\s+(\w+)\b', text, re.MULTILINE))
+
+    def find_parent(uname: str) -> str | None:
+        for rname, rbody in record_body.items():
+            if re.search(r'\w+\s*:\s*aliased\s+' + re.escape(uname) + r'\b', rbody):
+                return rname
+        return None
+
+    def field_referencing(uname: str) -> str | None:
+        fields = re.findall(r'(\w+)\s*:\s*aliased\s+' + re.escape(uname) + r'\b', text)
+        return fields[0] if fields else None
+
+    def first_nonano_own_field(uname: str) -> str | None:
+        m = re.search(
+            r'type\s+' + re.escape(uname) + r'(?:\s*\([^)]*\))?\s+is\s+record\b(.*?)end\s+record\b',
+            text, re.DOTALL,
+        )
+        if not m:
+            return None
+        keywords = {'when', 'case', 'discr', 'end', 'record', 'others'}
+        for f in re.findall(r'^\s{6,}(\w+)\s*:', m.group(1), re.MULTILINE):
+            if f not in keywords and not re.match(r'^anon\d+$', f):
+                return f
+        return None
+
+    renames: dict[str, str] = {}
+
+    for uname in union_names:
+        fname = field_referencing(uname)
+        if fname is None:
+            continue
+
+        is_anon_field = bool(re.match(r'^anon\d+$', fname))
+        parent = find_parent(uname)
+        stem = re.sub(r'_t$', '', parent) if parent else None
+
+        if is_anon_field:
+            own = first_nonano_own_field(uname)
+            if own:
+                candidate = own + '_t'
+                if candidate not in reserved:
+                    renames[uname] = candidate
+                    reserved.add(candidate)
+                    continue
+            # Fallback: parent record name + _union_t
+            if stem:
+                fallback = stem + '_union_t'
+                renames[uname] = fallback
+                reserved.add(fallback)
+        else:
+            same_field = [u for u in union_names if field_referencing(u) == fname]
+            if len(same_field) == 1:
+                renames[uname] = fname + '_t'
+            else:
+                if stem:
+                    renames[uname] = f'{stem}_{fname}_t'
+                else:
+                    renames[uname] = fname + '_t'
+
+    # Resolve any collisions within the proposed renames (defensive).
+    name_groups: dict[str, list[str]] = {}
+    for uname, pname in renames.items():
+        name_groups.setdefault(pname, []).append(uname)
+
+    final_renames: dict[str, str] = {}
+    for pname, group in name_groups.items():
+        sorted_group = sorted(group, key=lambda s: int(re.search(r'\d+', s).group()))
+        final_renames[sorted_group[0]] = pname
+        base = pname[: -len('_t')]
+        for i, un in enumerate(sorted_group[1:], 2):
+            final_renames[un] = f'{base}{i}_t'
+
+    if not final_renames:
+        return text
+
+    rename_pairs = sorted(final_renames.items(), key=lambda x: len(x[0]), reverse=True)
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])('
+        + '|'.join(re.escape(old) for old, _ in rename_pairs)
+        + r')(?![A-Za-z0-9_])',
+    )
+    lut = dict(rename_pairs)
+    return pattern.sub(lambda m: lut[m.group(1)], text)
+
+
+def _rename_anon_unions(out_dir: Path) -> int:
+    """Step 11: rename anon_unionNNN types to own-field-based names."""
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text = _rename_anon_unions_in_file(text)
+        if new_text != text:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had anon_union types renamed.')
     return count
 
 
