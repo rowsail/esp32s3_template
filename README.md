@@ -222,14 +222,16 @@ CPU receives interrupt (hardware)
    status register then increments the counter:
 
    ```ada
-   --  ESP32-S3 GPIO_STATUS_W1TC_REG (base 0x60004000, offset 0x4C).
-   GPIO_Status_W1TC : Interfaces.Unsigned_32
-     with Volatile, Import, Convention => Ada,
-          Address => System.Storage_Elements.To_Address (16#6000_404C#);
+   --  Imported from the __gnat_gpio_clear_intr_status wrapper in freertos.c,
+   --  which calls gpio_ll_clear_intr_status(&GPIO, mask).  The HAL function
+   --  is always_inline / static so it cannot be linked directly from Ada.
+   procedure GPIO_Clear_Intr_Status (Mask : Interfaces.Unsigned_32)
+     with Import, Convention => C,
+          External_Name => "__gnat_gpio_clear_intr_status";
 
    procedure On_Low is
    begin
-      GPIO_Status_W1TC := Interfaces.Shift_Left (1, Natural (GPIO0));
+      GPIO_Clear_Intr_Status (Interfaces.Shift_Left (1, Natural (GPIO0)));
       Press_Count := @ + 1;
    end On_Low;
    ```
