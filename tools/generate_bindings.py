@@ -642,6 +642,9 @@ def postprocess(out_dir: Path) -> None:
     # Step 7: convert --  arg-macro: comment pairs to Ada expression functions.
     _expand_arg_macros(out_dir)
 
+    # Step 8: convert pseudo-enum subtypes to proper Ada enumeration types.
+    _expand_pseudo_enums(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -1238,6 +1241,169 @@ def _expand_arg_macros(out_dir: Path) -> None:
             f.write_text(new_text)
             count += 1
     print(f'  {count} files had arg-macros expanded.')
+
+
+# ---------------------------------------------------------------------------
+# Step 8: convert pseudo-enum subtypes to proper Ada enumeration types
+# ---------------------------------------------------------------------------
+
+def _is_bitmask_values(values: list[int]) -> bool:
+    """Return True if there are 2+ distinct non-zero values and all are powers of two."""
+    non_zero = list({v for v in values if v != 0})
+    return len(non_zero) > 1 and all(v > 0 and (v & (v - 1)) == 0 for v in non_zero)
+
+
+def _gen_enum_type_decl(
+    type_name: str,
+    canonical: list[tuple[str, int]],
+    duplicates: list[tuple[str, int]],
+    indent: str,
+) -> str:
+    """Generate Ada enum type + representation clause + duplicate alias constants."""
+    lits = [lit for lit, _ in canonical]
+    vals = [val for _, val in canonical]
+    n = len(lits)
+    lines = []
+
+    lines.append(f'{indent}type {type_name} is')
+    for i, lit in enumerate(lits):
+        if n == 1:
+            lines.append(f'{indent}  ({lit})')
+        elif i == 0:
+            lines.append(f'{indent}  ({lit},')
+        elif i == n - 1:
+            lines.append(f'{indent}   {lit})')
+        else:
+            lines.append(f'{indent}   {lit},')
+    lines.append(f'{indent}with Convention => C;')
+
+    # Representation clause — omit when values are already 0, 1, 2, ..., n-1.
+    if vals != list(range(n)):
+        max_lit_len = max(len(lit) for lit in lits)
+        lines.append(f'{indent}for {type_name} use')
+        for i, (lit, val) in enumerate(canonical):
+            pad = ' ' * (max_lit_len - len(lit))
+            trailer = ');' if i == n - 1 else ','
+            if i == 0:
+                lines.append(f'{indent}  ({lit}{pad} => {val}{trailer}')
+            else:
+                lines.append(f'{indent}   {lit}{pad} => {val}{trailer}')
+
+    value_to_lit = {val: lit for lit, val in canonical}
+    for alias_lit, dup_val in duplicates:
+        canon_lit = value_to_lit.get(dup_val, lits[0])
+        lines.append(f'{indent}{alias_lit} : constant {type_name} := {canon_lit};')
+
+    return '\n'.join(lines)
+
+
+def _convert_pseudo_enums_in_file(text: str) -> tuple[str, dict[str, str]]:
+    """
+    Convert 'subtype T is unsigned' + constant blocks to proper Ada enum types.
+    Returns (new_text, rename_map) mapping old Ada constant names to new literal names.
+    """
+    rename_map: dict[str, str] = {}
+
+    subtype_re = re.compile(
+        r'^([ \t]*)subtype\s+(\w+)\s+is\s+unsigned\s*;',
+        re.MULTILINE,
+    )
+    conversions: list[tuple[str, str, list[tuple[str, str, int]]]] = []
+
+    for sm in subtype_re.finditer(text):
+        indent = sm.group(1)
+        type_name = sm.group(2)
+
+        const_re = re.compile(
+            r'^[ \t]*(' + re.escape(type_name) + r'_(\w+))\s*:\s*constant\s+'
+            + re.escape(type_name) + r'\s*:=\s*(-?\d+)\s*;',
+            re.MULTILINE,
+        )
+        entries: list[tuple[str, str, int]] = []
+        for cm in const_re.finditer(text):
+            entries.append((cm.group(1), cm.group(2), int(cm.group(3))))
+
+        if not entries:
+            continue
+
+        values = [v for _, _, v in entries]
+
+        # Skip if any value is outside 32-bit signed range.
+        if any(v > 2_147_483_647 or v < -2_147_483_648 for v in values):
+            continue
+
+        # Skip genuine bitmask types (multiple distinct non-zero powers of two).
+        if _is_bitmask_values(values):
+            continue
+
+        conversions.append((indent, type_name, entries))
+
+    if not conversions:
+        return text, {}
+
+    for indent, type_name, entries in conversions:
+        seen: dict[int, str] = {}
+        canonical: list[tuple[str, int]] = []
+        duplicates: list[tuple[str, int]] = []
+        for _, literal, value in entries:
+            if value not in seen:
+                seen[value] = literal
+                canonical.append((literal, value))
+            else:
+                duplicates.append((literal, value))
+
+        canonical.sort(key=lambda x: x[1])
+
+        for full_name, literal, _ in entries:
+            rename_map[full_name] = literal
+
+        new_decl = _gen_enum_type_decl(type_name, canonical, duplicates, indent)
+
+        text = re.sub(
+            r'^[ \t]*subtype\s+' + re.escape(type_name) + r'\s+is\s+unsigned\s*;\n',
+            new_decl + '\n',
+            text, flags=re.MULTILINE,
+        )
+        text = re.sub(
+            r'^[ \t]*' + re.escape(type_name) + r'_\w+\s*:\s*constant\s+'
+            + re.escape(type_name) + r'\s*:=\s*-?\d+\s*;\n',
+            '',
+            text, flags=re.MULTILINE,
+        )
+
+    return text, rename_map
+
+
+def _expand_pseudo_enums(out_dir: Path) -> int:
+    """Step 8: convert pseudo-enum subtypes to proper Ada enumeration types."""
+    all_renames: dict[str, str] = {}
+    changed = 0
+
+    for f in sorted(out_dir.glob('*.ads')):
+        text = f.read_text()
+        new_text, file_renames = _convert_pseudo_enums_in_file(text)
+        all_renames.update(file_renames)
+        if new_text != text:
+            f.write_text(new_text)
+            changed += 1
+
+    # Update cross-file references: old T_X constant names -> new enum literal names.
+    if all_renames:
+        rename_pairs = sorted(all_renames.items(), key=lambda x: len(x[0]), reverse=True)
+        pattern = re.compile(
+            r'(?<![A-Za-z0-9_])('
+            + '|'.join(re.escape(old) for old, _ in rename_pairs)
+            + r')(?![A-Za-z0-9_])',
+        )
+        lut = dict(rename_pairs)
+        for f in sorted(out_dir.glob('*.ads')):
+            text = f.read_text()
+            new_text = pattern.sub(lambda m: lut[m.group(1)], text)
+            if new_text != text:
+                f.write_text(new_text)
+
+    print(f'  {changed} files had pseudo-enums converted to proper Ada enum types.')
+    return changed
 
 
 def _expand_stdint(out_dir: Path) -> None:
