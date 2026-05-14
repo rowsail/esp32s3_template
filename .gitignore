@@ -6,5 +6,6 @@
 /build/
 /config/
 /runtime/
+/source/idf/
 sdkconfig
 sdkconfig.old

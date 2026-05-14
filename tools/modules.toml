@@ -1,0 +1,199 @@
+# ESP32-S3 IDF peripheral bindings module list
+#
+# Each entry maps an Ada package name to one or more IDF header files.
+# The generator script reads this file and calls `gcc -fdump-ada-spec`
+# on each header to produce Ada thin bindings in source/idf/.
+#
+# Format:
+#   [[module]]
+#   ada_package = "ESP32.Something"   # dot-separated Ada package name
+#   headers = ["driver/foo.h"]        # IDF headers to process (relative to an -I dir)
+#   enabled = true                    # set to false to skip without deleting the entry
+
+# ---------- GPIO ----------
+[[module]]
+ada_package = "ESP32.GPIO"
+headers = [
+  "driver/gpio.h",
+  "driver/gpio_filter.h",
+  "driver/gpio_etm.h",
+  "driver/dedic_gpio.h",
+  "driver/rtc_io.h",
+]
+enabled = true
+
+# ---------- UART ----------
+[[module]]
+ada_package = "ESP32.UART"
+headers = [
+  "driver/uart.h",
+  "driver/uart_select.h",
+]
+enabled = true
+
+# ---------- SPI ----------
+[[module]]
+ada_package = "ESP32.SPI"
+headers = [
+  "driver/spi_common.h",
+  "driver/spi_master.h",
+  "driver/spi_slave.h",
+]
+enabled = true
+
+# ---------- I2C ----------
+[[module]]
+ada_package = "ESP32.I2C"
+headers = [
+  "driver/i2c_master.h",
+  "driver/i2c_slave.h",
+  "driver/i2c_types.h",
+]
+enabled = true
+
+# ---------- I2S ----------
+[[module]]
+ada_package = "ESP32.I2S"
+headers = [
+  "driver/i2s_common.h",
+  "driver/i2s_std.h",
+  "driver/i2s_pdm.h",
+  "driver/i2s_tdm.h",
+  "driver/i2s_etm.h",
+]
+enabled = true
+
+# ---------- ADC ----------
+[[module]]
+ada_package = "ESP32.ADC"
+headers = [
+  "esp_adc/adc_oneshot.h",
+  "esp_adc/adc_continuous.h",
+  "esp_adc/adc_cali.h",
+  "esp_adc/adc_cali_scheme.h",
+]
+enabled = true
+
+# ---------- LEDC (PWM) ----------
+[[module]]
+ada_package = "ESP32.LEDC"
+headers = [
+  "driver/ledc.h",
+]
+enabled = true
+
+# ---------- MCPWM ----------
+[[module]]
+ada_package = "ESP32.MCPWM"
+headers = [
+  "driver/mcpwm_timer.h",
+  "driver/mcpwm_oper.h",
+  "driver/mcpwm_cmpr.h",
+  "driver/mcpwm_gen.h",
+  "driver/mcpwm_fault.h",
+  "driver/mcpwm_cap.h",
+  "driver/mcpwm_sync.h",
+]
+enabled = true
+
+# ---------- RMT ----------
+[[module]]
+ada_package = "ESP32.RMT"
+headers = [
+  "driver/rmt_tx.h",
+  "driver/rmt_rx.h",
+  "driver/rmt_encoder.h",
+  "driver/rmt_common.h",
+]
+enabled = true
+
+# ---------- GPTimer ----------
+[[module]]
+ada_package = "ESP32.GPTimer"
+headers = [
+  "driver/gptimer.h",
+  "driver/gptimer_etm.h",
+]
+enabled = true
+
+# ---------- PCNT (Pulse Counter) ----------
+[[module]]
+ada_package = "ESP32.PCNT"
+headers = [
+  "driver/pulse_cnt.h",
+]
+enabled = true
+
+# ---------- Touch Sensor ----------
+# Disabled: touch_sens.h in IDF v6.0.1 references types (touch_waterproof_config_t,
+# touch_proximity_config_t, touch_denoise_chan_config_t) that are not included
+# by the header itself, causing gcc -fdump-ada-spec to fail.
+[[module]]
+ada_package = "ESP32.Touch"
+headers = [
+  "driver/touch_sens.h",
+]
+enabled = false
+
+# ---------- Temperature Sensor ----------
+[[module]]
+ada_package = "ESP32.Temperature"
+headers = [
+  "driver/temperature_sensor.h",
+]
+enabled = true
+
+# ---------- Sigma-Delta Modulator ----------
+[[module]]
+ada_package = "ESP32.SDM"
+headers = [
+  "driver/sdm.h",
+]
+enabled = true
+
+# ---------- USB Serial/JTAG ----------
+[[module]]
+ada_package = "ESP32.USB_Serial_JTAG"
+headers = [
+  "driver/usb_serial_jtag.h",
+]
+enabled = true
+
+# ---------- Analog Comparator ----------
+[[module]]
+ada_package = "ESP32.Ana_Cmpr"
+headers = [
+  "driver/ana_cmpr.h",
+]
+enabled = true
+
+# ---------- Parallel IO ----------
+[[module]]
+ada_package = "ESP32.ParIO"
+headers = [
+  "driver/parlio_tx.h",
+  "driver/parlio_rx.h",
+]
+enabled = true
+
+# ---------- TWAI (CAN bus) ----------
+[[module]]
+ada_package = "ESP32.TWAI"
+headers = [
+  "driver/twai.h",
+]
+enabled = true
+
+# ---------- LCD ----------
+[[module]]
+ada_package = "ESP32.LCD"
+headers = [
+  "esp_lcd_panel_io.h",
+  "esp_lcd_panel_ops.h",
+  "esp_lcd_panel_dev.h",
+  "esp_lcd_types.h",
+  "esp_lcd_io_spi.h",
+  "esp_lcd_io_i2c.h",
+  "esp_lcd_io_i80.h",
+]
+enabled = true
