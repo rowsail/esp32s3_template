@@ -639,6 +639,9 @@ def postprocess(out_dir: Path) -> None:
     if fixed:
         print(f"  {fixed} files repaired (missing 'when 0 =>' in variant records).")
 
+    # Step 7: convert --  arg-macro: comment pairs to Ada expression functions.
+    _expand_arg_macros(out_dir)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: replace sys_ustdint with direct Interfaces.C types
@@ -703,6 +706,538 @@ def _fix_variant_records(out_dir: Path) -> int:
             f.write_text(new_text)
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Step 7: expand --  arg-macro: comment pairs into Ada expression functions
+# ---------------------------------------------------------------------------
+
+# Packages whose arg-macros are too complex or irrelevant to auto-expand.
+_SKIP_ARGMACRO_PKGS: frozenset[str] = frozenset({"freertos_portmacro", "stddef"})
+
+
+def _split_top_commas(s: str) -> list[str]:
+    """Split s on commas at brace-depth 0."""
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in s:
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    tail = ''.join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _parse_struct_init(body: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """
+    Parse a C struct-initializer body.
+    Returns (explicit_type_or_None, [(field, value), ...]).
+    Returns (None, []) if the body is not a struct initializer.
+    """
+    body = body.strip()
+    explicit: str | None = None
+    m = re.match(r'\(\s*(\w+)\s*\)\s*', body)
+    if m:
+        explicit = m.group(1)
+        body = body[m.end():].strip()
+    close = body.rfind('}')
+    if not body.startswith('{') or close < 0:
+        return None, []
+    body = body[: close + 1]
+    inner = body[1:-1].strip().rstrip(',').strip()
+    pairs: list[tuple[str, str]] = []
+    for part in _split_top_commas(inner):
+        part = part.strip()
+        fm = re.match(r'^\.(\w+)\s*:=\s*(.+)$', part, re.DOTALL)
+        if fm:
+            pairs.append((fm.group(1).strip(), fm.group(2).strip()))
+    return explicit, pairs
+
+
+def _is_complex_expr(value: str) -> bool:
+    """Return True if a C expression value is too complex to auto-convert."""
+    if '?' in value:
+        return True
+    if re.search(r'\d+\.\d+', value):  # floating-point literal
+        return True
+    if re.search(r'\(\s*[a-z]\w*\s*\)\s*[/*%]', value):  # arithmetic on a param
+        return True
+    return False
+
+
+def _c_suffix(ada_name: str) -> str | None:
+    """Extract the C constant name that an Ada constant name encodes."""
+    if re.match(r'^[A-Z][A-Z0-9_]+$', ada_name):
+        return ada_name
+    idx = ada_name.find('_t_')
+    if idx >= 0:
+        suf = ada_name[idx + 3:]
+        if suf:
+            return suf
+    return None
+
+
+def _scan_file_constants(text: str) -> list[tuple[str, str]]:
+    """Return [(ada_name, c_name)] for every constant declaration in text."""
+    result: list[tuple[str, str]] = []
+    for m in re.finditer(r'^\s+([A-Za-z]\w+)\s*:\s*constant\b', text, re.MULTILINE):
+        ada = m.group(1)
+        c = _c_suffix(ada)
+        if c:
+            result.append((ada, c))
+    return result
+
+
+def _build_id_maps(
+    text: str, pkg_stem: str, all_texts: dict[str, str]
+) -> tuple[dict[str, str], dict[str, tuple[str, str, bool]]]:
+    """
+    Build identifier resolution maps for a file.
+
+    Returns:
+      local:  c_name → ada_name (unqualified, same package)
+      remote: c_name → (pkg_stem, ada_name, needs_new_with)
+    """
+    local: dict[str, str] = {}
+    remote: dict[str, tuple[str, str, bool]] = {}
+
+    # Unsupported macros in the current file — extract numeric values.
+    for m in re.finditer(r'--\s+unsupported macro:\s+(\w+)\s+(.+)', text):
+        name, expr = m.group(1), m.group(2).strip()
+        stripped = re.sub(r'\([A-Za-z_]\w*\s*\)', '', expr).strip('() ')
+        if re.match(r'^-?\d+$', stripped):
+            local[name] = stripped
+
+    # Constants declared in the current file.
+    for ada, c in _scan_file_constants(text):
+        if c not in local:
+            local[c] = ada
+
+    # Build the set of packages already directly imported.
+    direct_set: set[str] = set(re.findall(r'^with\s+(\w+)\s*;', text, re.MULTILINE))
+    seen: set[str] = set(direct_set)
+
+    for imp in list(direct_set):
+        imp_text = all_texts.get(imp, '')
+        for ada, c in _scan_file_constants(imp_text):
+            if c not in local and c not in remote:
+                remote[c] = (imp, ada, False)  # direct import, no new 'with' needed
+        for trans in re.findall(r'^with\s+(\w+)\s*;', imp_text, re.MULTILINE):
+            if trans not in seen:
+                seen.add(trans)
+                trans_text = all_texts.get(trans, '')
+                for ada, c in _scan_file_constants(trans_text):
+                    if c not in local and c not in remote:
+                        remote[c] = (trans, ada, True)  # transitive — will need 'with'
+
+    return local, remote
+
+
+def _global_fallback(
+    c_name: str, all_texts: dict[str, str], pkg_stem: str
+) -> tuple[str, str] | None:
+    """Search all packages for c_name. Return (pkg, ada_name) only if unique."""
+    found: list[tuple[str, str]] = []
+    for stem, text in all_texts.items():
+        if stem == pkg_stem:
+            continue
+        for ada, c in _scan_file_constants(text):
+            if c == c_name:
+                found.append((stem, ada))
+    return found[0] if len(found) == 1 else None
+
+
+def _resolve_id(
+    name: str,
+    params: set[str],
+    local: dict[str, str],
+    remote: dict[str, tuple[str, str, bool]],
+    all_texts: dict[str, str],
+    pkg_stem: str,
+) -> tuple[str, str | None]:
+    """
+    Resolve a C identifier to its Ada form.
+    Returns (ada_expr, new_with_package_or_None).
+    """
+    if name == 'false':
+        return 'False', None
+    if name == 'true':
+        return 'True', None
+    if name in params:
+        return name, None
+    if name in local:
+        return local[name], None
+    if name in remote:
+        pkg, ada, needs_with = remote[name]
+        return f'{pkg}.{ada}', pkg if needs_with else None
+    r = _global_fallback(name, all_texts, pkg_stem)
+    if r:
+        pkg, ada = r
+        return f'{pkg}.{ada}', pkg
+    return name, None  # unknown — leave as-is
+
+
+def _extract_records(text: str) -> dict[str, list[tuple[str, str]]]:
+    """Return {type_name: [(field_name, ada_type)]} for every record in text."""
+    records: dict[str, list[tuple[str, str]]] = {}
+    for m in re.finditer(
+        r'type\s+(\w+)(?:\s*\([^)]*\))?\s+is\s+record\b(.*?)end\s+record\b',
+        text, re.DOTALL,
+    ):
+        name = m.group(1)
+        body = m.group(2)
+        fields: list[tuple[str, str]] = []
+        for fm in re.finditer(
+            r'^\s{6,}(\w+)\s*:\s*(?:aliased\s+)?(.+?)\s*;',
+            body, re.MULTILINE,
+        ):
+            fn = fm.group(1)
+            ft = fm.group(2).strip()
+            if fn not in ('when', 'case', 'discr', 'end', 'record'):
+                fields.append((fn, ft))
+        records[name] = fields
+    return records
+
+
+def _extract_subprograms(text: str) -> dict[str, dict]:
+    """Extract declared subprograms: {name: {kind, params: [(n,t)], ret}}."""
+    result: dict[str, dict] = {}
+    for m in re.finditer(r'^\s+(function|procedure)\s+(\w+)\b', text, re.MULTILINE):
+        kind = m.group(1)
+        name = m.group(2)
+        rest = text[m.end():]
+        params: list[tuple[str, str]] = []
+        ret: str | None = None
+        pm = re.match(r'\s*\n?\s*\(([^)]*)\)', rest)
+        if not pm:
+            pm = re.match(r'\s*\(([^)]*)\)', rest)
+        if pm:
+            for prm in re.finditer(
+                r'(\w+)\s*:\s*(?:access\s+(?:constant\s+)?)?([^;]+?)(?:;|$)',
+                pm.group(1),
+            ):
+                params.append((prm.group(1).strip(), prm.group(2).strip()))
+            rest = rest[pm.end():]
+        rm = re.match(r'\s*(?:\n\s*)?\breturn\s+([\w.]+)', rest)
+        if rm:
+            ret = rm.group(1)
+        result[name] = {'kind': kind, 'params': params, 'ret': ret}
+    return result
+
+
+def _find_return_type(
+    field_names: list[str],
+    records: dict[str, list[tuple[str, str]]],
+) -> str | None:
+    """Find the first non-anonymous record whose fields contain all given names."""
+    fset = set(field_names)
+    if not fset:
+        return None
+    for name, fields in records.items():
+        if name.startswith('anon_'):
+            continue
+        if fset <= {f[0] for f in fields}:
+            return name
+    return None
+
+
+def _convert_nested(
+    value: str,
+    field_type: str,
+    records: dict[str, list[tuple[str, str]]],
+) -> str:
+    """Convert a nested C struct initializer  { ... }  to an Ada aggregate."""
+    inner = value[1:-1].strip().rstrip(',').strip()
+    _, named = _parse_struct_init(value)
+    if named:
+        pairs = [f'{fn} => {fv}' for fn, fv in named]
+        return '(' + ', '.join(pairs) + ')'
+    # Plain value like {0} — look up the nested type.
+    lookup = re.sub(r'\b(?:aliased|access)\b\s*', '', field_type).strip().split('.')[-1]
+    if lookup in records:
+        flds = [(fn, ft) for fn, ft in records[lookup] if not fn.startswith('anon')]
+        if len(flds) == 1:
+            return f'({flds[0][0]} => {inner})'
+        if flds:
+            return '(' + ', '.join(f'{fn} => {inner}' for fn, _ in flds) + ')'
+    return f'({inner})'
+
+
+def _convert_struct_init(
+    fields: list[tuple[str, str]],
+    ret_type: str,
+    params: set[str],
+    rec_fields: dict[str, str],
+    records: dict[str, list[tuple[str, str]]],
+    local: dict[str, str],
+    remote: dict[str, tuple[str, str, bool]],
+    all_texts: dict[str, str],
+    pkg_stem: str,
+) -> tuple[str, set[str]]:
+    """
+    Generate an Ada qualified aggregate expression for a struct initializer.
+    Returns (aggregate_str, new_with_packages).
+    """
+    new_withs: set[str] = set()
+    pairs: list[str] = []
+    for fname, fval in fields:
+        fval = fval.strip()
+        if fval.startswith('{'):
+            ftype = rec_fields.get(fname, '')
+            ada_val = _convert_nested(fval, ftype, records)
+        elif fval == 'false':
+            ada_val = 'False'
+        elif fval == 'true':
+            ada_val = 'True'
+        else:
+            # Resolve all uppercase identifiers in the value.
+            ada_val = fval
+            for ident in re.findall(r'\b([A-Z][A-Z0-9_]+)\b', fval):
+                if ident not in params:
+                    resolved, new_w = _resolve_id(ident, params, local, remote, all_texts, pkg_stem)
+                    if resolved != ident:
+                        ada_val = re.sub(r'\b' + re.escape(ident) + r'\b', resolved, ada_val)
+                    if new_w:
+                        new_withs.add(new_w)
+            ada_val = re.sub(r'\bfalse\b', 'False', ada_val)
+            ada_val = re.sub(r'\btrue\b', 'True', ada_val)
+        pairs.append(f'{fname} => {ada_val}')
+    return f"{ret_type}'({', '.join(pairs)})", new_withs
+
+
+def _gen_expr_func(
+    name: str,
+    params: list[str],
+    param_types: dict[str, str],
+    ret: str,
+    body: str,
+    indent: str = '   ',
+) -> str:
+    """Generate an Ada expression function declaration."""
+    if params:
+        param_list = '; '.join(f'{p} : {param_types.get(p, "int")}' for p in params)
+        return (
+            f'{indent}function {name}\n'
+            f'{indent}  ({param_list})\n'
+            f'{indent}  return {ret} is\n'
+            f'{indent}  ({body});'
+        )
+    return f'{indent}function {name} return {ret} is\n{indent}  ({body});'
+
+
+def _gen_rename(
+    kind: str,
+    name: str,
+    params: list[tuple[str, str]],
+    ret: str | None,
+    target: str,
+    indent: str = '   ',
+) -> str:
+    """Generate a subprogram renaming declaration."""
+    param_list = '; '.join(f'{n} : {t}' for n, t in params) if params else ''
+    sig = f'{name} ({param_list})' if param_list else name
+    if kind == 'function' and ret:
+        return f'{indent}function {sig} return {ret} renames {target};'
+    return f'{indent}procedure {sig} renames {target};'
+
+
+def _insert_after_type(text: str, type_name: str, new_code: str) -> str:
+    """Insert new_code immediately after the record type declaration of type_name."""
+    type_m = re.search(
+        r'^\s+type\s+' + re.escape(type_name) + r'\b',
+        text, re.MULTILINE,
+    )
+    if not type_m:
+        end_m = re.search(r'^end\s+\w+\s*;', text, re.MULTILINE)
+        if end_m:
+            return text[: end_m.start()] + new_code + '\n\n' + text[end_m.start():]
+        return text + '\n\n' + new_code
+
+    end_rec = re.search(r'\bend\s+record\b', text[type_m.start():])
+    if not end_rec:
+        return text
+    abs_end = type_m.start() + end_rec.end()
+
+    sc = re.search(r';', text[abs_end:])
+    insert_pos = abs_end + sc.end() if sc else abs_end
+    return text[:insert_pos] + '\n\n' + new_code + text[insert_pos:]
+
+
+def _process_file_arg_macros(
+    text: str,
+    pkg_stem: str,
+    all_texts: dict[str, str],
+) -> str:
+    """Expand arg-macro comment pairs in one .ads file into Ada declarations."""
+    if pkg_stem in _SKIP_ARGMACRO_PKGS or '--  arg-macro:' not in text:
+        return text
+
+    macro_re = re.compile(
+        r'[ \t]*--\s+arg-macro:\s+(?:procedure|function)\s+(\w+)\s*\(([^)]*)\)\n'
+        r'[ \t]*--[ \t]+([^\n]*)',
+    )
+    macro_pairs: list[tuple[str, list[str], str]] = []
+    for m in macro_re.finditer(text):
+        name = m.group(1)
+        params_str = m.group(2).strip()
+        body = m.group(3).strip()
+        params = [p.strip() for p in params_str.split(',') if p.strip()]
+        macro_pairs.append((name, params, body))
+
+    if not macro_pairs:
+        return text
+
+    records = _extract_records(text)
+    subprograms = _extract_subprograms(text)
+    local, remote = _build_id_maps(text, pkg_stem, all_texts)
+
+    # Signatures of successfully generated macro functions (for delegate resolution).
+    gen_sigs: dict[str, tuple[list[str], dict[str, str], str]] = {}
+
+    generated: list[tuple[str | None, str]] = []  # (ret_type_or_None, ada_code)
+    new_withs_all: set[str] = set()
+
+    for name, params, body in macro_pairs:
+        body = body.strip()
+        params_set = set(params)
+
+        explicit_type, fields = _parse_struct_init(body)
+
+        if fields or explicit_type:
+            # ---- struct initializer ----
+            if any(_is_complex_expr(v) for _, v in fields):
+                continue
+
+            if explicit_type:
+                ret_type = explicit_type
+            else:
+                ret_type = _find_return_type([f for f, _ in fields], records)
+                if not ret_type:
+                    continue
+
+            rec_fields = {fn: ft for fn, ft in records.get(ret_type, [])}
+
+            # Infer parameter types from field assignments.
+            param_types: dict[str, str] = {}
+            for fname, fval in fields:
+                stripped = re.sub(r'^\(\s*(\w+)\s*\)$', r'\1', fval.strip())
+                if stripped in params_set and stripped not in param_types:
+                    ft = rec_fields.get(fname, 'int')
+                    param_types[stripped] = re.sub(r'\b(?:aliased|access)\b\s*', '', ft).strip()
+            for p in params:
+                if p not in param_types:
+                    param_types[p] = 'int'
+
+            agg, new_withs = _convert_struct_init(
+                fields, ret_type, params_set, rec_fields, records,
+                local, remote, all_texts, pkg_stem,
+            )
+            new_withs_all.update(new_withs)
+            code = _gen_expr_func(name, params, param_types, ret_type, agg)
+            gen_sigs[name] = (params, param_types, ret_type)
+            generated.append((ret_type, code))
+
+        elif re.match(r'^(\w+)\s*\(', body):
+            # ---- call expression (delegate or wrapper) ----
+            call_m = re.match(r'^(\w+)\s*\(([^)]*)\)', body)
+            if not call_m:
+                continue
+            called = call_m.group(1)
+            call_args = [a.strip() for a in call_m.group(2).split(',') if a.strip()]
+
+            if called in gen_sigs:
+                c_params, c_ptypes, c_ret = gen_sigs[called]
+                param_types = {}
+                for i, arg in enumerate(call_args):
+                    stripped = re.sub(r'^\(\s*(\w+)\s*\)$', r'\1', arg)
+                    if stripped in params_set and stripped not in param_types and i < len(c_params):
+                        param_types[stripped] = c_ptypes.get(c_params[i], 'int')
+                for p in params:
+                    if p not in param_types:
+                        param_types[p] = 'int'
+                code = _gen_expr_func(
+                    name, params, param_types, c_ret,
+                    f"{called}({', '.join(call_args)})",
+                )
+                gen_sigs[name] = (params, param_types, c_ret)
+                generated.append((c_ret, code))
+
+            elif called in subprograms:
+                sub = subprograms[called]
+                sub_params = sub['params']
+                ret = sub['ret']
+                exact = (call_args == params)
+                if sub['kind'] == 'procedure':
+                    code = _gen_rename('procedure', name, sub_params, None, called)
+                    generated.append((None, code))
+                else:
+                    if exact and ret:
+                        code = _gen_rename('function', name, sub_params, ret, called)
+                    else:
+                        ptypes = {n: t for n, t in sub_params}
+                        code = _gen_expr_func(
+                            name, params, ptypes, ret or 'int',
+                            f"{called}({', '.join(call_args)})",
+                        )
+                    gen_sigs[name] = (params, {n: t for n, t in sub_params}, ret or 'int')
+                    generated.append((None, code))
+
+    if not generated:
+        return text
+
+    # Remove all arg-macro comment pairs.
+    text = re.sub(
+        r'[ \t]*--\s+arg-macro:[^\n]*\n[ \t]*--[ \t]+[^\n]*\n',
+        '', text,
+    )
+
+    # Insert generated code after the relevant record type declarations.
+    type_groups: dict[str | None, list[str]] = {}
+    for ret_type, code in generated:
+        type_groups.setdefault(ret_type, []).append(code)
+
+    for ret_type, codes in type_groups.items():
+        block = '\n\n'.join(codes)
+        if ret_type is None:
+            end_m = re.search(r'^end\s+\w+\s*;', text, re.MULTILINE)
+            if end_m:
+                text = text[: end_m.start()] + block + '\n\n' + text[end_m.start():]
+        else:
+            text = _insert_after_type(text, ret_type, block)
+
+    # Add any new with-clauses that were needed.
+    existing_withs = set(re.findall(r'^with\s+(\w+)\s*;', text, re.MULTILINE))
+    new_to_add = sorted(new_withs_all - existing_withs)
+    if new_to_add:
+        pkg_m = re.search(r'^package\s+', text, re.MULTILINE)
+        if pkg_m:
+            clauses = '\n'.join(f'with {w};' for w in new_to_add) + '\n'
+            text = text[: pkg_m.start()] + clauses + text[pkg_m.start():]
+
+    return text
+
+
+def _expand_arg_macros(out_dir: Path) -> None:
+    """Step 7: convert --  arg-macro: comment pairs to Ada expression functions."""
+    all_texts = {f.stem: f.read_text() for f in sorted(out_dir.glob('*.ads'))}
+    count = 0
+    for f in sorted(out_dir.glob('*.ads')):
+        if '--  arg-macro:' not in all_texts.get(f.stem, ''):
+            continue
+        new_text = _process_file_arg_macros(all_texts[f.stem], f.stem, all_texts)
+        if new_text != all_texts[f.stem]:
+            f.write_text(new_text)
+            count += 1
+    print(f'  {count} files had arg-macros expanded.')
 
 
 def _expand_stdint(out_dir: Path) -> None:
